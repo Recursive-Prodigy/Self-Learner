@@ -1,0 +1,44 @@
+[
+  {
+    "id": "dispatch_table",
+    "name": "Dispatch Table (manage.py)",
+    "file": "manage.py",
+    "snippet": "menu_actions = {\n    '1': add_entry_flow,\n    '2': view_entries_flow,\n    '3': delete_entry_flow,\n    '4': run_analytics\n}\naction = menu_actions.get(user_choice)\nif action:\n    action()",
+    "level": 2
+  },
+  {
+    "id": "boundary_validation",
+    "name": "Boundary Validation (parser.py)",
+    "file": "parser.py",
+    "snippet": "def validate_entry(raw_data: dict, required_fields: list) -> bool:\n    if not isinstance(raw_data, dict):\n        return False\n    return all(field in raw_data and raw_data[field] is not None for field in required_fields)",
+    "level": 1
+  },
+  {
+    "id": "parameterized_queries",
+    "name": "Parameterized vs Whitelisted SQL (database.py)",
+    "file": "database.py",
+    "snippet": "allowed_tables = {'books', 'buy_list', 'build_list'}\nif table_name not in allowed_tables:\n    raise ValueError('Invalid table name')\nquery = f'SELECT * FROM {table_name} WHERE status = ?'\ncursor.execute(query, (status,))",
+    "level": 1
+  },
+  {
+    "id": "config_driven_ddl",
+    "name": "Config-Driven Schema Generation (setup_db.py)",
+    "file": "setup_db.py",
+    "snippet": "type_map = {'TEXT': 'TEXT', 'INTEGER': 'INTEGER', 'BOOLEAN': 'INTEGER'}\ncol_defs = [f'{col} {type_map.get(t, \"TEXT\")}' for col, t in config['fields'].items()]\nsql = f'CREATE TABLE IF NOT EXISTS {table} (id INTEGER PRIMARY KEY, {', '.join(col_defs)})'",
+    "level": 1
+  },
+  {
+    "id": "dict_zip_rows",
+    "name": "Dynamic Row Mapping via dict(zip()) (database.py)",
+    "file": "database.py",
+    "snippet": "cursor.execute(query)\ncols = [col[0] for col in cursor.description]\nrows = [dict(zip(cols, row, strict=True)) for row in cursor.fetchall()]",
+    "level": 1
+  },
+  {
+    "id": "date_aggregation",
+    "name": "SQLite strftime Date Aggregation (analytics.py)",
+    "file": "analytics.py",
+    "snippet": "query = '''\n    SELECT strftime('%Y-%m', date_added) AS month, COUNT(*), SUM(price)\n    FROM books\n    GROUP BY month\n    ORDER BY month DESC\n'''",
+    "level": 1
+  }
+]
