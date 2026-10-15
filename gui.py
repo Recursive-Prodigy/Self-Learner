@@ -1,14 +1,29 @@
+import base64
+import datetime
+import io
 import json
 from pathlib import Path
 import re
+import ssl
 import sys
 import textwrap
 import threading
 import tkinter as tk
-from tkinter import ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+import zlib
 
-from analyzer import analyze_code
-from providers import call_llm, get_last_call_info
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+from analyzer import analyze_code, compress_code, generate_dataflow_diagram
+from providers import call_continue, call_llm, get_last_call_info
 from quiz import evaluate_answer, generate_question_from_snippet
 
 BASE_DIR = (
@@ -16,6 +31,7 @@ BASE_DIR = (
     if getattr(sys, "frozen", False)
     else Path(__file__).resolve().parent
 )
+DEFAULT_WORKSPACE_DIR = BASE_DIR / "workspace_data"
 DATA_FILE = BASE_DIR / "concepts.json"
 
 PROVIDER_CHOICES = {
@@ -60,6 +76,278 @@ def save_concept_level(name: str, level: int):
         json.dump(concepts, f, indent=2)
 
 
+def get_ssl_context():
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    return ctx
+
+
+def sanitize_mermaid(raw_code: str) -> str:
+    """Sanitizes raw Mermaid syntax so external parsers and compilers do not fail."""
+    code = raw_code.strip()
+    code = re.sub(r"^```(?:mermaid)?", "", code, flags=re.MULTILINE)
+    code = re.sub(r"```$", "", code, flags=re.MULTILINE)
+    code = re.sub(r"%%\{.*?\}%%", "", code, flags=re.DOTALL).strip()
+
+    lines = []
+    has_header = False
+    for line in code.splitlines():
+        trimmed = line.strip()
+        if not trimmed:
+            continue
+        if trimmed.startswith(("flowchart", "graph")):
+            has_header = True
+            lines.append(trimmed)
+            continue
+
+        trimmed = re.sub(r"\s*&\s*", " and ", trimmed)
+        trimmed = re.sub(r"--\s*([^-\n>|]+?)\s*-->", r"-->|\1|", trimmed)
+
+        def wrap_brackets(m):
+            inner = m.group(1).strip()
+            if inner.startswith('"') and inner.endswith('"'):
+                inner = inner[1:-1]
+            inner = inner.replace('"', "'")
+            return f'["{inner}"]'
+
+        def wrap_braces(m):
+            inner = m.group(1).strip()
+            if inner.startswith('"') and inner.endswith('"'):
+                inner = inner[1:-1]
+            inner = inner.replace('"', "'")
+            return f'{{"{inner}"}}'
+
+        trimmed = re.sub(r'\[([^\[\]\n]+?)\]', wrap_brackets, trimmed)
+        trimmed = re.sub(r'\{([^{}\n]+?)\}', wrap_braces, trimmed)
+        lines.append(trimmed)
+
+    if not has_header:
+        lines.insert(0, "flowchart TD")
+
+    return "\n".join(lines)
+
+
+def enhance_svg_dark_contrast(svg_text: str) -> str:
+    """Injects high-contrast CSS and replaces dark strokes with electric blue (#60a5fa)
+
+    so connecting lines and arrowheads are clearly visible on dark backgrounds.
+    """
+    custom_style = """
+    <style>
+      .edgePaths path, .flowchart-link, path.path { stroke: #60a5fa !important; stroke-width: 2.5px !important; }
+      .marker, marker path, #flowchart-pointEnd, #flowchart-pointStart { fill: #60a5fa !important; stroke: #60a5fa !important; }
+      .edgeLabel { color: #93c5fd !important; background-color: #18181b !important; }
+      .edgeLabel rect { fill: #18181b !important; opacity: 0.85 !important; }
+      .edgeLabel span { color: #93c5fd !important; background-color: #18181b !important; padding: 2px 4px; border-radius: 4px; }
+      .node rect, .node circle, .node polygon { stroke-width: 2px !important; }
+    </style>
+    """
+    if "<svg" in svg_text:
+        svg_text = re.sub(r'(<svg[^>]*>)', r'\1' + custom_style, svg_text, count=1)
+
+    # Replace legacy black/dark gray strokes on paths and arrows
+    svg_text = re.sub(r'stroke="#333333"', 'stroke="#60a5fa"', svg_text)
+    svg_text = re.sub(r'stroke="#333"', 'stroke="#60a5fa"', svg_text)
+    svg_text = re.sub(r'stroke="black"', 'stroke="#60a5fa"', svg_text)
+    svg_text = re.sub(r'fill="#333333"', 'fill="#60a5fa"', svg_text)
+    svg_text = re.sub(r'fill="#333"', 'fill="#60a5fa"', svg_text)
+    return svg_text
+
+
+def encode_mermaid_live_pako(clean_code: str) -> str:
+    """Builds the payload format used by the official Mermaid Live Editor with dark styling."""
+    state = {
+        "code": clean_code,
+        "mermaid": json.dumps({
+            "theme": "dark",
+            "themeVariables": {
+                "darkMode": True,
+                "background": "#18181b",
+                "lineColor": "#60a5fa",
+                "arrowheadColor": "#60a5fa",
+                "primaryColor": "#1e293b",
+                "primaryTextColor": "#f8fafc",
+                "primaryBorderColor": "#3b82f6"
+            }
+        }, indent=2),
+        "autoSync": True,
+        "updateDiagram": True,
+    }
+    json_bytes = json.dumps(state).encode("utf-8")
+    compressed = zlib.compress(json_bytes, 9)
+    return base64.urlsafe_b64encode(compressed).decode("ascii").rstrip("=")
+
+
+def fetch_diagram_data(clean_code: str, workspace_dir: Path) -> tuple[bytes | None, Path, Path]:
+    """Fetches PNG and SVG assets with bright link lines and prepares local viewing files."""
+    ssl_ctx = get_ssl_context()
+    browser_headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "*/*",
+    }
+
+    png_data = None
+    svg_text = None
+
+    # Step A: Fetch SVG vector markup
+    try:
+        req_svg = urllib.request.Request(
+            "https://kroki.io/mermaid/svg",
+            data=clean_code.encode("utf-8"),
+            headers={"Content-Type": "text/plain; charset=utf-8", **browser_headers},
+        )
+        with urllib.request.urlopen(req_svg, timeout=10, context=ssl_ctx) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+            if "<svg" in content:
+                svg_text = content
+    except Exception:
+        pass
+
+    # Save SVG with enhanced line contrast
+    local_svg_path = workspace_dir / "dataflow_diagram.svg"
+    if svg_text:
+        svg_text = enhance_svg_dark_contrast(svg_text)
+        local_svg_path.write_text(svg_text, encoding="utf-8")
+    else:
+        fallback_svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="600" height="200" style="background:#18181b">
+        <text x="30" y="50" fill="#38bdf8" font-family="monospace" font-size="14">Mermaid Diagram Generated</text>
+        <text x="30" y="90" fill="#a1a1aa" font-family="monospace" font-size="12">Open Mermaid Live Editor to view full interactive diagram.</text>
+        </svg>"""
+        local_svg_path.write_text(fallback_svg, encoding="utf-8")
+
+    # Step B: Render / Fetch PNG Bytes for In-App Display
+    # Option 1: Local CairoSVG rasterization (instant, no network)
+    if HAS_CAIROSVG and svg_text:
+        try:
+            png_data = cairosvg.svg2png(bytestring=svg_text.encode("utf-8"))
+        except Exception:
+            pass
+
+    # Option 2: QuickChart JSON POST (with format="png")
+    if not png_data:
+        try:
+            payload = json.dumps({
+                "chart": clean_code,
+                "format": "png",
+                "theme": "dark",
+                "width": 640,
+                "backgroundColor": "#18181b"
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://quickchart.io/mermaid",
+                data=payload,
+                headers={"Content-Type": "application/json", **browser_headers},
+            )
+            with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
+                data = resp.read()
+                if data.startswith(b"\x89PNG"):
+                    png_data = data
+        except Exception:
+            pass
+
+    # Option 3: Mermaid.ink pako PNG request
+    if not png_data:
+        try:
+            pako_str = encode_mermaid_live_pako(clean_code)
+            url = f"https://mermaid.ink/img/pako:{pako_str}?bgColor=18181b"
+            req = urllib.request.Request(url, headers=browser_headers)
+            with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
+                data = resp.read()
+                if data.startswith(b"\x89PNG"):
+                    png_data = data
+        except Exception:
+            pass
+
+    # Option 4: Kroki Plain Text POST
+    if not png_data:
+        try:
+            req = urllib.request.Request(
+                "https://kroki.io/mermaid/png",
+                data=clean_code.encode("utf-8"),
+                headers={"Content-Type": "text/plain; charset=utf-8", "Accept": "image/png", **browser_headers},
+            )
+            with urllib.request.urlopen(req, timeout=10, context=ssl_ctx) as resp:
+                data = resp.read()
+                if data.startswith(b"\x89PNG"):
+                    png_data = data
+        except Exception:
+            pass
+
+    # Step C: Save Windows-safe HTML redirect bridge for Live Editor
+    pako_str = encode_mermaid_live_pako(clean_code)
+    live_target_url = f"https://mermaid.live/edit#pako:{pako_str}"
+    local_bridge_path = workspace_dir / "open_live_editor.html"
+    bridge_html = f"""<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Opening Mermaid Live Editor...</title>
+  <meta http-equiv="refresh" content="0; url={live_target_url}">
+  <script>window.location.replace("{live_target_url}");</script>
+</head>
+<body style="background:#18181b;color:#a1a1aa;font-family:sans-serif;padding:32px;text-align:center;">
+  <h2>Redirecting to Mermaid Live Editor...</h2>
+  <p>If your browser does not redirect automatically, <a href="{live_target_url}" style="color:#38bdf8;">click here</a>.</p>
+</body>
+</html>"""
+    local_bridge_path.write_text(bridge_html, encoding="utf-8")
+
+    return png_data, local_svg_path, local_bridge_path
+
+
+def make_read_only(widget: tk.Text):
+    widget.config(
+        state="disabled",
+        cursor="xterm",
+        selectbackground="#2563eb",
+        selectforeground="#ffffff",
+    )
+
+    widget.tag_configure("sel", background="#2563eb", foreground="#ffffff")
+    widget.tag_raise("sel")
+
+    widget.bind("<Button-1>", lambda e: e.widget.focus_set(), add="+")
+
+    def copy_selection(event=None):
+        try:
+            selected_text = widget.get(tk.SEL_FIRST, tk.SEL_LAST)
+            widget.clipboard_clear()
+            widget.clipboard_append(selected_text)
+        except tk.TclError:
+            pass
+        return "break"
+
+    def select_all(event=None):
+        widget.tag_add(tk.SEL, "1.0", "end-1c")
+        return "break"
+
+    widget.bind("<Control-c>", copy_selection)
+    widget.bind("<Control-C>", copy_selection)
+    widget.bind("<Control-a>", select_all)
+    widget.bind("<Control-A>", select_all)
+
+    menu = tk.Menu(
+        widget,
+        tearoff=0,
+        bg="#27272a",
+        fg="#f4f4f5",
+        activebackground="#3b82f6",
+        activeforeground="#ffffff",
+    )
+    menu.add_command(label="Copy (Ctrl+C)", command=copy_selection)
+    menu.add_command(label="Select All (Ctrl+A)", command=select_all)
+
+    def show_context_menu(event):
+        try:
+            widget.focus_set()
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    widget.bind("<Button-3>", show_context_menu)
+
+
 def render_markdown(widget: tk.Text, markdown_text: str):
     lines = markdown_text.split("\n")
     i = 0
@@ -81,79 +369,6 @@ def render_markdown(widget: tk.Text, markdown_text: str):
             else:
                 widget.insert(tk.END, token, default_tag)
 
-    def render_table(table_lines: list):
-        rows = []
-        for line in table_lines:
-            clean_test = (
-                line.replace("|", "")
-                .replace("-", "")
-                .replace(":", "")
-                .replace(" ", "")
-            )
-            if not clean_test:
-                continue
-            cells = [c.strip() for c in line.strip().split("|")]
-            if line.strip().startswith("|") and len(cells) > 1:
-                cells = cells[1:]
-            if line.strip().endswith("|") and len(cells) > 0 and cells[-1] == "":
-                cells = cells[:-1]
-            rows.append([c.replace("**", "").replace("`", "") for c in cells])
-
-        if not rows:
-            return
-
-        n_cols = max(len(r) for r in rows)
-        for r in rows:
-            while len(r) < n_cols:
-                r.append("")
-
-        col_lens = [
-            max((len(rows[r][c]) for r in range(len(rows))), default=8)
-            for c in range(n_cols)
-        ]
-        budget = max(24, 60 - (3 * n_cols + 1))
-        weight_sum = sum(max(1, l) for l in col_lens) or 1
-        widths = [
-            max(8, int(budget * (max(1, l) / weight_sum))) for l in col_lens
-        ]
-
-        while sum(widths) > budget:
-            idx = widths.index(max(widths))
-            if widths[idx] <= 8:
-                break
-            widths[idx] -= 1
-
-        top_b = "┌" + "┬".join("─" * (w + 2) for w in widths) + "┐\n"
-        mid_b = "├" + "┼".join("─" * (w + 2) for w in widths) + "┤\n"
-        bot_b = "└" + "┴".join("─" * (w + 2) for w in widths) + "┘\n"
-
-        widget.insert(tk.END, "\n" + top_b, "table_border")
-
-        for r_idx, row in enumerate(rows):
-            wrapped_cols = [
-                textwrap.wrap(row[c], width=widths[c]) or [""]
-                for c in range(n_cols)
-            ]
-            max_lines = max(len(w) for w in wrapped_cols)
-            tag = "table_header" if r_idx == 0 else "table_body"
-
-            for l_idx in range(max_lines):
-                widget.insert(tk.END, "│", "table_border")
-                for c in range(n_cols):
-                    cell_text = (
-                        wrapped_cols[c][l_idx]
-                        if l_idx < len(wrapped_cols[c])
-                        else ""
-                    )
-                    widget.insert(tk.END, f" {cell_text:<{widths[c]}} ", tag)
-                    widget.insert(tk.END, "│", "table_border")
-                widget.insert(tk.END, "\n")
-
-            if r_idx == 0 and len(rows) > 1:
-                widget.insert(tk.END, mid_b, "table_border")
-
-        widget.insert(tk.END, bot_b + "\n", "table_border")
-
     while i < len(lines):
         line = lines[i]
 
@@ -173,18 +388,6 @@ def render_markdown(widget: tk.Text, markdown_text: str):
         if in_code_block:
             code_lines.append(line)
             i += 1
-            continue
-
-        if line.strip().startswith("|") and line.strip().endswith("|"):
-            tbl_lines = []
-            while (
-                i < len(lines)
-                and lines[i].strip().startswith("|")
-                and lines[i].strip().endswith("|")
-            ):
-                tbl_lines.append(lines[i].strip())
-                i += 1
-            render_table(tbl_lines)
             continue
 
         stripped = line.strip()
@@ -235,66 +438,172 @@ def render_markdown(widget: tk.Text, markdown_text: str):
             render_inline(line + "\n", default_tag="normal")
         i += 1
 
+    widget.tag_raise("sel")
+
 
 class LearnerApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
         self.title("Self Learner")
-        self.geometry("1080x880")
+        self.geometry("1200x890")
         self.configure(bg="#18181b")
 
-        # Persistent Cache
+        self._init_workspace_dirs()
+
+        self.base_font_size = 10
+        self.base_code_size = 10
+
         self.cached_snippet = ""
         self.chat_history = []
+        self.current_chat_id = None
+        self._image_refs = []
 
-        # Quiz State
         self.active_concept_name = ""
         self.active_level = 1
         self.active_question = ""
         self.awaiting_quiz_answer = False
 
+        self._autoscroll_widget = None
+        self._autoscroll_anchor_y = 0
+        self._autoscroll_current_y = 0
+        self._autoscroll_timer = None
+
+        self._init_ttk_styles()
         self._build_ui()
-        self._show_welcome_instructions()
-        self.after(80, self._init_sash_50_50)
+        self._init_per_widget_zoom()
+        self._init_autoscroll()
+        self._restore_session()
+        self.after(80, self._init_sashes)
+
+    def _init_workspace_dirs(self):
+        settings_file = BASE_DIR / "workspace_settings.json"
+        self.workspace_dir = DEFAULT_WORKSPACE_DIR
+        if settings_file.exists():
+            try:
+                with open(settings_file, "r", encoding="utf-8") as f:
+                    cfg = json.load(f)
+                    custom_path = cfg.get("workspace_dir")
+                    if custom_path and Path(custom_path).exists():
+                        self.workspace_dir = Path(custom_path)
+            except Exception:
+                pass
+
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        (self.workspace_dir / "chats").mkdir(parents=True, exist_ok=True)
+
+    def _save_workspace_settings(self):
+        settings_file = BASE_DIR / "workspace_settings.json"
+        with open(settings_file, "w", encoding="utf-8") as f:
+            json.dump({"workspace_dir": str(self.workspace_dir)}, f, indent=2)
+
+    def _init_ttk_styles(self):
+        self.style = ttk.Style(self)
+        try:
+            self.style.theme_use("clam")
+        except Exception:
+            pass
+
+        self.style.configure(
+            "Dark.Vertical.TScrollbar",
+            gripcount=0,
+            background="#333336",
+            darkcolor="#18181b",
+            lightcolor="#18181b",
+            troughcolor="#18181b",
+            bordercolor="#18181b",
+            arrowcolor="#71717a",
+            relief="flat",
+            arrowsize=10,
+        )
+        self.style.map(
+            "Dark.Vertical.TScrollbar",
+            background=[("active", "#4e4e52"), ("disabled", "#222225")],
+            arrowcolor=[("active", "#ffffff")],
+        )
+
+        self.style.configure(
+            "Dark.Horizontal.TScrollbar",
+            gripcount=0,
+            background="#333336",
+            darkcolor="#18181b",
+            lightcolor="#18181b",
+            troughcolor="#18181b",
+            bordercolor="#18181b",
+            arrowcolor="#71717a",
+            relief="flat",
+            arrowsize=10,
+        )
+        self.style.map(
+            "Dark.Horizontal.TScrollbar",
+            background=[("active", "#4e4e52"), ("disabled", "#222225")],
+            arrowcolor=[("active", "#ffffff")],
+        )
+
+        self.style.configure(
+            "TCombobox",
+            fieldbackground="#18181b",
+            background="#27272a",
+            foreground="#ffffff",
+            arrowcolor="#ffffff",
+            darkcolor="#27272a",
+            lightcolor="#27272a",
+            bordercolor="#3f3f46",
+        )
+        self.style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", "#18181b")],
+            selectbackground=[("readonly", "#18181b")],
+            selectforeground=[("readonly", "#ffffff")],
+        )
 
     def _build_ui(self):
-        # 1. Top Navigation Bar
-        nav_frame = tk.Frame(self, bg="#27272a", padx=12, pady=10)
+        nav_frame = tk.Frame(self, bg="#27272a", padx=12, pady=8)
         nav_frame.pack(fill="x")
 
         self.btn_dissect = tk.Button(
             nav_frame,
-            text="[ Mode: Dissector ]",
+            text="[ Dissector ]",
             bg="#3b82f6",
             fg="white",
             relief="flat",
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 9, "bold"),
             command=self._set_mode_dissect,
         )
-        self.btn_dissect.pack(side="left", padx=4)
+        self.btn_dissect.pack(side="left", padx=2)
+
+        self.btn_compress = tk.Button(
+            nav_frame,
+            text="[ Compressor ]",
+            bg="#3f3f46",
+            fg="#d4d4d8",
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            command=self._set_mode_compress,
+        )
+        self.btn_compress.pack(side="left", padx=2)
 
         self.btn_chat = tk.Button(
             nav_frame,
-            text="[ Mode: Mentor Chat ]",
+            text="[ Mentor Chat ]",
             bg="#3f3f46",
             fg="#d4d4d8",
             relief="flat",
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 9, "bold"),
             command=self._set_mode_chat,
         )
-        self.btn_chat.pack(side="left", padx=4)
+        self.btn_chat.pack(side="left", padx=2)
 
         self.btn_quiz = tk.Button(
             nav_frame,
-            text="[ Mode: Concept Quiz ]",
+            text="[ Concept Quiz ]",
             bg="#3f3f46",
             fg="#d4d4d8",
             relief="flat",
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 9, "bold"),
             command=self._set_mode_quiz,
         )
-        self.btn_quiz.pack(side="left", padx=4)
+        self.btn_quiz.pack(side="left", padx=2)
 
         self.cache_chip = tk.Label(
             nav_frame,
@@ -305,7 +614,7 @@ class LearnerApp(tk.Tk):
             padx=6,
             pady=2,
         )
-        self.cache_chip.pack(side="left", padx=8)
+        self.cache_chip.pack(side="left", padx=6)
 
         self.btn_clear_cache = tk.Button(
             nav_frame,
@@ -317,6 +626,41 @@ class LearnerApp(tk.Tk):
             command=self._clear_cached_snippet,
         )
         self.btn_clear_cache.pack(side="left", padx=2)
+
+        self.btn_gh_import = tk.Button(
+            nav_frame,
+            text="🌐 Import GitHub",
+            bg="#18181b",
+            fg="#38bdf8",
+            relief="flat",
+            font=("Segoe UI", 8, "bold"),
+            padx=6,
+            command=self._import_from_github,
+        )
+        self.btn_gh_import.pack(side="left", padx=6)
+
+        self.btn_workspace = tk.Button(
+            nav_frame,
+            text="📁 Workspace",
+            bg="#18181b",
+            fg="#a1a1aa",
+            relief="flat",
+            font=("Segoe UI", 8),
+            padx=6,
+            command=self._choose_workspace_dir,
+        )
+        self.btn_workspace.pack(side="left", padx=2)
+
+        self.btn_continue = tk.Button(
+            nav_frame,
+            text="⚠️ Continue Output",
+            bg="#f59e0b",
+            fg="#000000",
+            relief="flat",
+            font=("Segoe UI", 8, "bold"),
+            padx=6,
+            command=self._trigger_continue,
+        )
 
         self.status_lbl = tk.Label(
             nav_frame,
@@ -331,7 +675,7 @@ class LearnerApp(tk.Tk):
             nav_frame,
             values=list(PROVIDER_CHOICES.keys()),
             state="readonly",
-            width=23,
+            width=20,
         )
         self.provider_combo.current(0)
         self.provider_combo.pack(side="right", padx=(4, 8))
@@ -344,8 +688,7 @@ class LearnerApp(tk.Tk):
             font=("Segoe UI", 9),
         ).pack(side="right")
 
-        # 2. Resizable 50/50 Paned Window
-        self.paned = tk.PanedWindow(
+        self.paned_standard = tk.PanedWindow(
             self,
             orient=tk.HORIZONTAL,
             bg="#3f3f46",
@@ -354,13 +697,11 @@ class LearnerApp(tk.Tk):
             bd=0,
             opaqueresize=True,
         )
-        self.paned.pack(fill="both", expand=True, padx=8, pady=8)
+        self.paned_standard.pack(fill="both", expand=True, padx=8, pady=8)
 
-        # ─────────────────────────────────────────────────────────────
-        # LEFT PANE: Output & Explanation Feed (READ-ONLY)
-        # ─────────────────────────────────────────────────────────────
-        self.left_pane = tk.Frame(self.paned, bg="#18181b")
-        self.paned.add(self.left_pane, minsize=340)
+        # LEFT PANE
+        self.left_pane = tk.Frame(self.paned_standard, bg="#18181b")
+        self.paned_standard.add(self.left_pane, minsize=320)
 
         self.left_ctrl_bar = tk.Frame(self.left_pane, bg="#27272a", padx=10, pady=8)
         self.left_ctrl_bar.pack(fill="x")
@@ -371,7 +712,7 @@ class LearnerApp(tk.Tk):
 
         tk.Label(
             self.dissect_left_bar,
-            text="Focus Mode:",
+            text="Focus:",
             bg="#27272a",
             fg="#e4e4e7",
             font=("Segoe UI", 9, "bold"),
@@ -380,7 +721,7 @@ class LearnerApp(tk.Tk):
         self.focus_mode_combo = ttk.Combobox(
             self.dissect_left_bar,
             values=[
-                "Unified (Mechanics First)",
+                "Summary (Mechanics First)",
                 "Line-by-Line Mechanics Only",
                 "Fixes & Clean Alternatives",
                 "Trade-offs & Gotchas Only",
@@ -406,20 +747,31 @@ class LearnerApp(tk.Tk):
         self.chat_left_bar = tk.Frame(self.left_ctrl_bar, bg="#27272a")
         tk.Label(
             self.chat_left_bar,
-            text="💬 Mentor Dialogue & Explanations",
+            text="💬 Mentor Dialogue",
             bg="#27272a",
             fg="#a78bfa",
             font=("Segoe UI", 9, "bold"),
         ).pack(side="left")
 
-        tk.Button(
+        self.btn_chat_hist = tk.Button(
             self.chat_left_bar,
-            text="Clear Chat",
+            text="📂 History",
             bg="#3f3f46",
             fg="#d4d4d8",
             relief="flat",
             font=("Segoe UI", 8),
-            command=self._clear_chat_history,
+            command=self._open_chat_history_modal,
+        )
+        self.btn_chat_hist.pack(side="right", padx=(4, 0))
+
+        tk.Button(
+            self.chat_left_bar,
+            text="+ New Chat",
+            bg="#3f3f46",
+            fg="#d4d4d8",
+            relief="flat",
+            font=("Segoe UI", 8),
+            command=self._start_new_chat,
         ).pack(side="right")
 
         # Quiz Controls
@@ -433,7 +785,10 @@ class LearnerApp(tk.Tk):
         ).pack(side="left", padx=2)
 
         self.level_combo = ttk.Combobox(
-            self.quiz_left_bar, values=LEVEL_OPTIONS, state="readonly", width=28
+            self.quiz_left_bar,
+            values=LEVEL_OPTIONS,
+            state="readonly",
+            width=45,
         )
         self.level_combo.current(0)
         self.level_combo.pack(side="left", padx=4)
@@ -449,18 +804,16 @@ class LearnerApp(tk.Tk):
         )
         self.btn_quiz_action.pack(side="right")
 
-        # Read-Only Banner Strip
         out_banner = tk.Frame(self.left_pane, bg="#121214", padx=10, pady=4)
         out_banner.pack(fill="x", pady=(4, 0))
         tk.Label(
             out_banner,
-            text="OUTPUT & RESPONSES [READ-ONLY]",
+            text="OUTPUT & RESPONSES [READ-ONLY — SELECTABLE]",
             bg="#121214",
             fg="#71717a",
             font=("Consolas", 8, "bold"),
         ).pack(side="left")
 
-        # Text Output Area (Read-Only)
         out_frame = tk.Frame(self.left_pane, bg="#18181b")
         out_frame.pack(fill="both", expand=True)
 
@@ -471,36 +824,33 @@ class LearnerApp(tk.Tk):
             insertbackground="#121214",
             relief="flat",
             wrap="word",
-            font=("Segoe UI", 10),
             padx=14,
             pady=14,
         )
         self.output_txt.pack(side="left", fill="both", expand=True)
+        make_read_only(self.output_txt)
 
-        # Intercept any user keystrokes in output to ensure it remains strictly un-editable
-        self.output_txt.bind("<Key>", lambda e: "break")
-
-        scroll_out = tk.Scrollbar(
-            out_frame, command=self.output_txt.yview, bg="#18181b", troughcolor="#121214"
+        self.scroll_out_v = ttk.Scrollbar(
+            out_frame,
+            orient="vertical",
+            command=self.output_txt.yview,
+            style="Dark.Vertical.TScrollbar",
         )
-        scroll_out.pack(side="right", fill="y")
-        self.output_txt.config(yscrollcommand=scroll_out.set)
+        self.scroll_out_v.pack(side="right", fill="y")
+        self.output_txt.config(yscrollcommand=self.scroll_out_v.set)
 
-        self._configure_text_tags()
+        # RIGHT PANE
+        self.right_pane = tk.Frame(self.paned_standard, bg="#18181b")
+        self.paned_standard.add(self.right_pane, minsize=320)
 
-        # ─────────────────────────────────────────────────────────────
-        # RIGHT PANE: Code Snippet & Interactive Inputs (EDITABLE)
-        # ─────────────────────────────────────────────────────────────
-        self.right_pane = tk.Frame(self.paned, bg="#18181b")
-        self.paned.add(self.right_pane, minsize=340)
-
-        # Mode A: Dissector Right View
+        # Dissector Right View
         self.dissect_right_frame = tk.Frame(self.right_pane, bg="#18181b")
         self.dissect_right_frame.pack(fill="both", expand=True)
 
-        right_top = tk.Frame(self.dissect_right_frame, bg="#27272a", padx=10, pady=8)
+        right_top = tk.Frame(
+            self.dissect_right_frame, bg="#27272a", padx=10, pady=8
+        )
         right_top.pack(fill="x")
-
         tk.Label(
             right_top,
             text="PYTHON CODE SNIPPET (INPUT)",
@@ -528,33 +878,36 @@ class LearnerApp(tk.Tk):
             fg="#f4f4f5",
             insertbackground="white",
             relief="flat",
-            font=("Consolas", 10),
             wrap="none",
             padx=10,
             pady=10,
         )
         self.dissect_code_txt.pack(side="left", fill="both", expand=True)
 
-        code_v_scroll = tk.Scrollbar(
-            code_box_frame, command=self.dissect_code_txt.yview, bg="#18181b", troughcolor="#121214"
+        self.dissect_v_scroll = ttk.Scrollbar(
+            code_box_frame,
+            orient="vertical",
+            command=self.dissect_code_txt.yview,
+            style="Dark.Vertical.TScrollbar",
         )
-        code_v_scroll.pack(side="right", fill="y")
-        self.dissect_code_txt.config(yscrollcommand=code_v_scroll.set)
+        self.dissect_v_scroll.pack(side="right", fill="y")
+        self.dissect_code_txt.config(yscrollcommand=self.dissect_v_scroll.set)
 
-        code_h_scroll = tk.Scrollbar(
+        self.dissect_h_scroll = ttk.Scrollbar(
             self.dissect_right_frame,
             orient="horizontal",
             command=self.dissect_code_txt.xview,
-            bg="#18181b",
-            troughcolor="#121214",
+            style="Dark.Horizontal.TScrollbar",
         )
-        code_h_scroll.pack(fill="x")
-        self.dissect_code_txt.config(xscrollcommand=code_h_scroll.set)
+        self.dissect_h_scroll.pack(fill="x")
+        self.dissect_code_txt.config(xscrollcommand=self.dissect_h_scroll.set)
 
-        # Mode B: Chat Right View
+        # Chat Right View
         self.chat_right_frame = tk.Frame(self.right_pane, bg="#18181b")
 
-        chat_top = tk.Frame(self.chat_right_frame, bg="#27272a", padx=10, pady=6)
+        chat_top = tk.Frame(
+            self.chat_right_frame, bg="#27272a", padx=10, pady=6
+        )
         chat_top.pack(fill="x")
         tk.Label(
             chat_top,
@@ -564,21 +917,34 @@ class LearnerApp(tk.Tk):
             font=("Segoe UI", 9, "bold"),
         ).pack(side="left")
 
+        chat_code_box = tk.Frame(self.chat_right_frame, bg="#121214")
+        chat_code_box.pack(fill="both", expand=True, pady=(4, 6))
+
         self.chat_code_txt = tk.Text(
-            self.chat_right_frame,
+            chat_code_box,
             height=12,
             bg="#121214",
             fg="#f4f4f5",
             insertbackground="white",
             relief="flat",
-            font=("Consolas", 10),
             wrap="none",
             padx=8,
             pady=8,
         )
-        self.chat_code_txt.pack(fill="both", expand=True, pady=(4, 6))
+        self.chat_code_txt.pack(side="left", fill="both", expand=True)
 
-        chat_mid = tk.Frame(self.chat_right_frame, bg="#27272a", padx=10, pady=6)
+        self.chat_code_v_scroll = ttk.Scrollbar(
+            chat_code_box,
+            orient="vertical",
+            command=self.chat_code_txt.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        self.chat_code_v_scroll.pack(side="right", fill="y")
+        self.chat_code_txt.config(yscrollcommand=self.chat_code_v_scroll.set)
+
+        chat_mid = tk.Frame(
+            self.chat_right_frame, bg="#27272a", padx=10, pady=6
+        )
         chat_mid.pack(fill="x")
         tk.Label(
             chat_mid,
@@ -588,18 +954,30 @@ class LearnerApp(tk.Tk):
             font=("Segoe UI", 9, "bold"),
         ).pack(side="left")
 
+        chat_query_box = tk.Frame(self.chat_right_frame, bg="#18181b")
+        chat_query_box.pack(fill="x", pady=(4, 6))
+
         self.chat_query_txt = tk.Text(
-            self.chat_right_frame,
+            chat_query_box,
             height=8,
             bg="#18181b",
             fg="#f4f4f5",
             insertbackground="white",
             relief="flat",
-            font=("Segoe UI", 10),
+            wrap="word",
             padx=8,
             pady=8,
         )
-        self.chat_query_txt.pack(fill="x", pady=(4, 6))
+        self.chat_query_txt.pack(side="left", fill="both", expand=True)
+
+        self.chat_query_v_scroll = ttk.Scrollbar(
+            chat_query_box,
+            orient="vertical",
+            command=self.chat_query_txt.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        self.chat_query_v_scroll.pack(side="right", fill="y")
+        self.chat_query_txt.config(yscrollcommand=self.chat_query_v_scroll.set)
 
         chat_btn_bar = tk.Frame(self.chat_right_frame, bg="#18181b")
         chat_btn_bar.pack(fill="x")
@@ -614,10 +992,12 @@ class LearnerApp(tk.Tk):
         )
         self.btn_chat_send.pack(side="right")
 
-        # Mode C: Quiz Right View
+        # Quiz Right View
         self.quiz_right_frame = tk.Frame(self.right_pane, bg="#18181b")
 
-        quiz_top = tk.Frame(self.quiz_right_frame, bg="#27272a", padx=10, pady=6)
+        quiz_top = tk.Frame(
+            self.quiz_right_frame, bg="#27272a", padx=10, pady=6
+        )
         quiz_top.pack(fill="x")
         tk.Label(
             quiz_top,
@@ -627,19 +1007,30 @@ class LearnerApp(tk.Tk):
             font=("Segoe UI", 9, "bold"),
         ).pack(side="left")
 
+        quiz_code_box = tk.Frame(self.quiz_right_frame, bg="#121214")
+        quiz_code_box.pack(fill="both", expand=True, pady=(4, 6))
+
         self.quiz_code_txt = tk.Text(
-            self.quiz_right_frame,
+            quiz_code_box,
             height=12,
             bg="#121214",
             fg="#f4f4f5",
             insertbackground="white",
             relief="flat",
-            font=("Consolas", 10),
             wrap="none",
             padx=8,
             pady=8,
         )
-        self.quiz_code_txt.pack(fill="both", expand=True, pady=(4, 6))
+        self.quiz_code_txt.pack(side="left", fill="both", expand=True)
+
+        self.quiz_code_v_scroll = ttk.Scrollbar(
+            quiz_code_box,
+            orient="vertical",
+            command=self.quiz_code_txt.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        self.quiz_code_v_scroll.pack(side="right", fill="y")
+        self.quiz_code_txt.config(yscrollcommand=self.quiz_code_v_scroll.set)
 
         self.quiz_mid_lbl = tk.Label(
             self.quiz_right_frame,
@@ -652,18 +1043,30 @@ class LearnerApp(tk.Tk):
         )
         self.quiz_mid_lbl.pack(fill="x")
 
+        quiz_ans_box = tk.Frame(self.quiz_right_frame, bg="#18181b")
+        quiz_ans_box.pack(fill="x", pady=(4, 6))
+
         self.quiz_answer_txt = tk.Text(
-            self.quiz_right_frame,
+            quiz_ans_box,
             height=8,
             bg="#18181b",
             fg="#f4f4f5",
             insertbackground="white",
             relief="flat",
-            font=("Segoe UI", 10),
+            wrap="word",
             padx=8,
             pady=8,
         )
-        self.quiz_answer_txt.pack(fill="x", pady=(4, 6))
+        self.quiz_answer_txt.pack(side="left", fill="both", expand=True)
+
+        self.quiz_ans_v_scroll = ttk.Scrollbar(
+            quiz_ans_box,
+            orient="vertical",
+            command=self.quiz_answer_txt.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        self.quiz_ans_v_scroll.pack(side="right", fill="y")
+        self.quiz_answer_txt.config(yscrollcommand=self.quiz_ans_v_scroll.set)
 
         quiz_btn_bar = tk.Frame(self.quiz_right_frame, bg="#18181b")
         quiz_btn_bar.pack(fill="x")
@@ -678,121 +1081,447 @@ class LearnerApp(tk.Tk):
         )
         self.btn_quiz_submit.pack(side="right")
 
-        # Global Hotkey
-        self.bind("<Control-Return>", lambda e: self._on_action_click())
+        # Compressor PanedWindow
+        self.paned_compress = tk.PanedWindow(
+            self,
+            orient=tk.HORIZONTAL,
+            bg="#3f3f46",
+            sashwidth=6,
+            sashrelief="flat",
+            bd=0,
+            opaqueresize=True,
+        )
+
+        self.comp_left_pane = tk.Frame(self.paned_compress, bg="#18181b")
+        self.paned_compress.add(self.comp_left_pane, minsize=240)
+
+        c_left_top = tk.Frame(
+            self.comp_left_pane, bg="#27272a", padx=10, pady=8
+        )
+        c_left_top.pack(fill="x")
+        tk.Label(
+            c_left_top,
+            text="1. RAW CODE (INPUT)",
+            bg="#27272a",
+            fg="#38bdf8",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left")
+
+        self.btn_run_compress = tk.Button(
+            c_left_top,
+            text="Compress (Ctrl+Enter)",
+            bg="#e11d48",
+            fg="white",
+            relief="flat",
+            font=("Segoe UI", 8, "bold"),
+            command=self._on_action_click,
+        )
+        self.btn_run_compress.pack(side="right")
+
+        c_box1 = tk.Frame(self.comp_left_pane, bg="#121214")
+        c_box1.pack(fill="both", expand=True, pady=(4, 0))
+
+        self.compress_raw_txt = tk.Text(
+            c_box1,
+            bg="#121214",
+            fg="#f4f4f5",
+            insertbackground="white",
+            relief="flat",
+            wrap="none",
+            padx=8,
+            pady=8,
+        )
+        self.compress_raw_txt.pack(side="left", fill="both", expand=True)
+
+        self.comp_raw_v_scroll = ttk.Scrollbar(
+            c_box1,
+            orient="vertical",
+            command=self.compress_raw_txt.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        self.comp_raw_v_scroll.pack(side="right", fill="y")
+        self.compress_raw_txt.config(yscrollcommand=self.comp_raw_v_scroll.set)
+
+        self.comp_raw_h_scroll = ttk.Scrollbar(
+            self.comp_left_pane,
+            orient="horizontal",
+            command=self.compress_raw_txt.xview,
+            style="Dark.Horizontal.TScrollbar",
+        )
+        self.comp_raw_h_scroll.pack(fill="x")
+        self.compress_raw_txt.config(xscrollcommand=self.comp_raw_h_scroll.set)
+
+        self.comp_mid_pane = tk.Frame(self.paned_compress, bg="#18181b")
+        self.paned_compress.add(self.comp_mid_pane, minsize=240)
+
+        c_mid_top = tk.Frame(
+            self.comp_mid_pane, bg="#27272a", padx=10, pady=8
+        )
+        c_mid_top.pack(fill="x")
+        tk.Label(
+            c_mid_top,
+            text="2. TRANSFORMATIONS & AUDIT",
+            bg="#27272a",
+            fg="#fbbf24",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left")
+
+        c_box2 = tk.Frame(self.comp_mid_pane, bg="#121214")
+        c_box2.pack(fill="both", expand=True, pady=(4, 0))
+
+        self.compress_audit_txt = tk.Text(
+            c_box2,
+            bg="#121214",
+            fg="#d4d4d8",
+            insertbackground="#121214",
+            relief="flat",
+            wrap="word",
+            padx=10,
+            pady=10,
+        )
+        self.compress_audit_txt.pack(side="left", fill="both", expand=True)
+        make_read_only(self.compress_audit_txt)
+
+        self.comp_audit_v_scroll = ttk.Scrollbar(
+            c_box2,
+            orient="vertical",
+            command=self.compress_audit_txt.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        self.comp_audit_v_scroll.pack(side="right", fill="y")
+        self.compress_audit_txt.config(
+            yscrollcommand=self.comp_audit_v_scroll.set
+        )
+
+        self.comp_right_pane = tk.Frame(self.paned_compress, bg="#18181b")
+        self.paned_compress.add(self.comp_right_pane, minsize=240)
+
+        c_right_top = tk.Frame(
+            self.comp_right_pane, bg="#27272a", padx=10, pady=8
+        )
+        c_right_top.pack(fill="x")
+        tk.Label(
+            c_right_top,
+            text="3. COMPRESSED CODE ONLY",
+            bg="#27272a",
+            fg="#4ade80",
+            font=("Segoe UI", 9, "bold"),
+        ).pack(side="left")
+
+        self.btn_copy_code = tk.Button(
+            c_right_top,
+            text="Copy Code",
+            bg="#10b981",
+            fg="white",
+            relief="flat",
+            font=("Segoe UI", 8, "bold"),
+            command=self._copy_compressed_code,
+        )
+        self.btn_copy_code.pack(side="right")
+
+        c_box3 = tk.Frame(self.comp_right_pane, bg="#121214")
+        c_box3.pack(fill="both", expand=True, pady=(4, 0))
+
+        self.compress_code_txt = tk.Text(
+            c_box3,
+            bg="#0f172a",
+            fg="#4ade80",
+            insertbackground="#0f172a",
+            relief="flat",
+            wrap="none",
+            padx=8,
+            pady=8,
+        )
+        self.compress_code_txt.pack(side="left", fill="both", expand=True)
+        make_read_only(self.compress_code_txt)
+
+        self.comp_code_v_scroll = ttk.Scrollbar(
+            c_box3,
+            orient="vertical",
+            command=self.compress_code_txt.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        self.comp_code_v_scroll.pack(side="right", fill="y")
+        self.compress_code_txt.config(
+            yscrollcommand=self.comp_code_v_scroll.set
+        )
+
+        self.comp_code_h_scroll = ttk.Scrollbar(
+            self.comp_right_pane,
+            orient="horizontal",
+            command=self.compress_code_txt.xview,
+            style="Dark.Horizontal.TScrollbar",
+        )
+        self.comp_code_h_scroll.pack(fill="x")
+        self.compress_code_txt.config(xscrollcommand=self.comp_code_h_scroll.set)
+
         self.current_mode = "dissect"
 
+    def _init_per_widget_zoom(self):
+        self._panel_names = {
+            self.output_txt: "Output Feed",
+            self.dissect_code_txt: "Code Editor",
+            self.chat_code_txt: "Chat Snippet",
+            self.chat_query_txt: "Chat Query Box",
+            self.quiz_code_txt: "Quiz Snippet",
+            self.quiz_answer_txt: "Quiz Answer Box",
+            self.compress_raw_txt: "Compressor (Raw)",
+            self.compress_audit_txt: "Compressor (Audit)",
+            self.compress_code_txt: "Compressor (Result)",
+        }
+
+        self._zoom_levels = {w: 10 for w in self._panel_names}
+
+        for w in self._panel_names:
+            w.bind("<Control-equal>", lambda e, wid=w: self._zoom_widget(wid, 1))
+            w.bind("<Control-plus>", lambda e, wid=w: self._zoom_widget(wid, 1))
+            w.bind("<Control-KP_Add>", lambda e, wid=w: self._zoom_widget(wid, 1))
+            w.bind("<Control-minus>", lambda e, wid=w: self._zoom_widget(wid, -1))
+            w.bind(
+                "<Control-KP_Subtract>",
+                lambda e, wid=w: self._zoom_widget(wid, -1),
+            )
+            w.bind(
+                "<Control-0>",
+                lambda e, wid=w: self._zoom_widget(wid, 0, reset=True),
+            )
+            w.bind("<Control-MouseWheel>", lambda e, wid=w: self._on_wheel_zoom(e, wid))
+
+        self.bind("<Control-equal>", lambda e: self._zoom_focused(1))
+        self.bind("<Control-plus>", lambda e: self._zoom_focused(1))
+        self.bind("<Control-KP_Add>", lambda e: self._zoom_focused(1))
+        self.bind("<Control-minus>", lambda e: self._zoom_focused(-1))
+        self.bind("<Control-KP_Subtract>", lambda e: self._zoom_focused(-1))
+        self.bind("<Control-0>", lambda e: self._zoom_focused(0, reset=True))
+        self.bind("<Control-Return>", lambda e: self._on_action_click())
+
+        for w in self._panel_names:
+            self._apply_widget_font(w)
+
+    def _init_autoscroll(self):
+        for w in self._panel_names:
+            w.bind("<Button-2>", lambda e, wid=w: self._toggle_autoscroll(e, wid))
+
+    def _toggle_autoscroll(self, event, widget: tk.Text):
+        if self._autoscroll_widget == widget:
+            self._stop_autoscroll()
+            return "break"
+
+        self._stop_autoscroll()
+        self._autoscroll_widget = widget
+        self._autoscroll_anchor_y = event.y_root
+        self._autoscroll_current_y = event.y_root
+
+        try:
+            widget.config(cursor="sb_v_double_arrow")
+        except Exception:
+            widget.config(cursor="fleur")
+
+        widget.bind("<Motion>", self._on_autoscroll_motion)
+        widget.bind("<Button-1>", lambda e: self._stop_autoscroll(), add="+")
+        self.bind("<Escape>", lambda e: self._stop_autoscroll(), add="+")
+
+        name = self._panel_names.get(widget, "Panel")
+        self._set_status(f"Autoscroll Active ({name}) — Move mouse up/down")
+        self._run_autoscroll_step()
+        return "break"
+
+    def _on_autoscroll_motion(self, event):
+        self._autoscroll_current_y = event.y_root
+
+    def _run_autoscroll_step(self):
+        if not self._autoscroll_widget:
+            return
+
+        dy = self._autoscroll_current_y - self._autoscroll_anchor_y
+        deadzone = 12
+
+        if abs(dy) > deadzone:
+            direction = 1 if dy > 0 else -1
+            distance = abs(dy) - deadzone
+            step = direction * max(1, int((distance / 20) ** 1.3))
+            try:
+                self._autoscroll_widget.yview_scroll(step, "units")
+            except Exception:
+                self._stop_autoscroll()
+                return
+
+        self._autoscroll_timer = self.after(35, self._run_autoscroll_step)
+
+    def _stop_autoscroll(self):
+        if self._autoscroll_timer:
+            self.after_cancel(self._autoscroll_timer)
+            self._autoscroll_timer = None
+
+        if self._autoscroll_widget:
+            try:
+                self._autoscroll_widget.config(cursor="xterm")
+                self._autoscroll_widget.unbind("<Motion>")
+            except Exception:
+                pass
+            self._autoscroll_widget = None
+            self._set_status("Ready")
+
+    def _get_target_widget(self):
+        focused = self.focus_get()
+        if focused in self._panel_names:
+            return focused
+
+        x, y = self.winfo_pointerx(), self.winfo_pointery()
+        hovered = self.winfo_containing(x, y)
+        if hovered in self._panel_names:
+            return hovered
+
+        if self.current_mode == "compress":
+            return self.compress_audit_txt
+        elif self.current_mode == "dissect":
+            return self.output_txt
+        elif self.current_mode == "chat":
+            return self.output_txt
+        return self.output_txt
+
+    def _zoom_focused(self, delta: int, reset: bool = False):
+        target = self._get_target_widget()
+        self._zoom_widget(target, delta, reset)
+
+    def _on_wheel_zoom(self, event, widget):
+        delta = 1 if event.delta > 0 else -1
+        self._zoom_widget(widget, delta)
+        return "break"
+
+    def _zoom_widget(self, widget: tk.Text, delta: int, reset: bool = False):
+        if reset:
+            self._zoom_levels[widget] = 10
+        else:
+            self._zoom_levels[widget] = max(
+                7, min(26, self._zoom_levels[widget] + delta)
+            )
+
+        self._apply_widget_font(widget)
+        name = self._panel_names.get(widget, "Panel")
+        pct = int((self._zoom_levels[widget] / 10) * 100)
+        self._set_status(f"Zoom ({name}): {pct}%")
+        return "break"
+
+    def _apply_widget_font(self, widget: tk.Text):
+        size = self._zoom_levels[widget]
+        is_code = widget in [
+            self.dissect_code_txt,
+            self.chat_code_txt,
+            self.quiz_code_txt,
+            self.compress_raw_txt,
+            self.compress_code_txt,
+        ]
+
+        if is_code:
+            widget.config(font=("Consolas", size))
+        else:
+            widget.config(font=("Segoe UI", size))
+
+        if widget in [self.output_txt, self.compress_audit_txt]:
+            self._configure_text_tags(widget, size)
+
+    def _configure_text_tags(self, txt: tk.Text, size: int):
+        s = size
+        cs = size
+
+        txt.tag_configure("normal", font=("Segoe UI", s), foreground="#d4d4d8")
+        txt.tag_configure(
+            "meta_badge",
+            font=("Segoe UI", max(7, s - 1), "bold"),
+            foreground="#38bdf8",
+            background="#0f172a",
+        )
+        txt.tag_configure(
+            "chat_user_badge",
+            font=("Segoe UI", s, "bold"),
+            foreground="#fbbf24",
+            background="#27272a",
+        )
+        txt.tag_configure(
+            "meta_trail",
+            font=("Segoe UI", max(7, s - 2)),
+            foreground="#f87171",
+        )
+        txt.tag_configure(
+            "h1",
+            font=("Segoe UI", s + 4, "bold"),
+            foreground="#60a5fa",
+            spacing1=8,
+            spacing3=4,
+        )
+        txt.tag_configure(
+            "h2",
+            font=("Segoe UI", s + 2, "bold"),
+            foreground="#818cf8",
+            spacing1=8,
+            spacing3=4,
+        )
+        txt.tag_configure(
+            "h3",
+            font=("Segoe UI", s + 1, "bold"),
+            foreground="#a78bfa",
+            spacing1=6,
+            spacing3=2,
+        )
+        txt.tag_configure(
+            "h4",
+            font=("Segoe UI", s, "bold"),
+            foreground="#c084fc",
+            spacing1=4,
+            spacing3=2,
+        )
+        txt.tag_configure(
+            "bold", font=("Segoe UI", s, "bold"), foreground="#ffffff"
+        )
+        txt.tag_configure(
+            "inline_code",
+            font=("Consolas", cs),
+            foreground="#fb7185",
+            background="#27272a",
+        )
+        txt.tag_configure(
+            "code_block",
+            font=("Consolas", cs),
+            foreground="#4ade80",
+            background="#18181b",
+        )
+        txt.tag_configure(
+            "divider", font=("Consolas", cs), foreground="#3f3f46"
+        )
+        txt.tag_configure(
+            "quote", font=("Segoe UI", s, "italic"), foreground="#94a3b8"
+        )
+
+        txt.tag_configure("sel", background="#2563eb", foreground="#ffffff")
+        txt.tag_raise("sel")
+
     def _show_welcome_instructions(self):
-        """Displays clear instructions on initial launch."""
-        welcome_md = """### SELF LEARNER // WORKSPACE GUIDE
+        welcome_md = """### SELF LEARNER // WORKSPACE READY
 
-**How this layout works:**
+**Visual Dataflow Diagrams:**
+• Dissect code and click **`[ 📊 Generate Dataflow Diagram (Mermaid) ]`**.
+• Renders visually in the feed as an embedded diagram, with an option to open the live interactive view in your browser.
 
-1. **Left Pane (Here) -> Responses & Explanations**
-   • This feed is **Read-Only** so outputs never get accidentally edited.
-   • Line-by-line mechanics, mentor replies, and quiz questions appear here.
-
-2. **Right Pane -> Input Workspace**
-   • **Dissector Mode:** Paste the Python code you want dissected into the right editor.
-   • **Mentor Chat:** Code goes in the upper box, and your specific question goes in the lower box.
-   • **Concept Quiz:** The snippet stays on top, and you type your solution into the bottom box.
-
-3. **Global Hotkey:**
-   • Press **Ctrl+Enter** from any active input box to run.
+**Navigation & Zoom:**
+• **Cleaner Alternatives Only:** Focuses on idiomatic Python without noise.
+• **VS Code Scrollbars:** Sleek, dark scrollbars line all panels.
+• **Zoom Independently:** Use **Ctrl +** / **Ctrl -** (or **Ctrl + MouseWheel**) on any panel to scale font sizes.
 """
         self.output_txt.config(state="normal")
         self.output_txt.delete("1.0", tk.END)
         render_markdown(self.output_txt, welcome_md)
         self.output_txt.config(state="disabled")
 
-    def _init_sash_50_50(self):
+    def _init_sashes(self):
         self.update_idletasks()
-        w = self.paned.winfo_width()
-        if w > 200:
-            self.paned.sash_place(0, w // 2, 0)
+        w = self.winfo_width()
+        if w > 400:
+            self.paned_standard.sash_place(0, w // 2, 0)
+            self.paned_compress.sash_place(0, w // 3, 0)
+            self.paned_compress.sash_place(1, (2 * w) // 3, 0)
         else:
-            self.after(80, self._init_sash_50_50)
-
-    def _configure_text_tags(self):
-        self.output_txt.tag_configure(
-            "normal", font=("Segoe UI", 10), foreground="#d4d4d8"
-        )
-        self.output_txt.tag_configure(
-            "meta_badge",
-            font=("Segoe UI", 9, "bold"),
-            foreground="#38bdf8",
-            background="#0f172a",
-        )
-        self.output_txt.tag_configure(
-            "chat_user_badge",
-            font=("Segoe UI", 10, "bold"),
-            foreground="#fbbf24",
-            background="#27272a",
-        )
-        self.output_txt.tag_configure(
-            "meta_trail", font=("Segoe UI", 8), foreground="#f87171"
-        )
-        self.output_txt.tag_configure(
-            "h1",
-            font=("Segoe UI", 14, "bold"),
-            foreground="#60a5fa",
-            spacing1=8,
-            spacing3=4,
-        )
-        self.output_txt.tag_configure(
-            "h2",
-            font=("Segoe UI", 12, "bold"),
-            foreground="#818cf8",
-            spacing1=8,
-            spacing3=4,
-        )
-        self.output_txt.tag_configure(
-            "h3",
-            font=("Segoe UI", 11, "bold"),
-            foreground="#a78bfa",
-            spacing1=6,
-            spacing3=2,
-        )
-        self.output_txt.tag_configure(
-            "h4",
-            font=("Segoe UI", 10, "bold"),
-            foreground="#c084fc",
-            spacing1=4,
-            spacing3=2,
-        )
-        self.output_txt.tag_configure(
-            "bold", font=("Segoe UI", 10, "bold"), foreground="#ffffff"
-        )
-        self.output_txt.tag_configure(
-            "inline_code",
-            font=("Consolas", 9),
-            foreground="#fb7185",
-            background="#27272a",
-        )
-        self.output_txt.tag_configure(
-            "code_block",
-            font=("Consolas", 9),
-            foreground="#4ade80",
-            background="#18181b",
-        )
-        self.output_txt.tag_configure(
-            "divider", font=("Consolas", 9), foreground="#3f3f46"
-        )
-        self.output_txt.tag_configure(
-            "quote", font=("Segoe UI", 10, "italic"), foreground="#94a3b8"
-        )
-        self.output_txt.tag_configure(
-            "table_border", font=("Consolas", 9), foreground="#52525b"
-        )
-        self.output_txt.tag_configure(
-            "table_header",
-            font=("Consolas", 9, "bold"),
-            foreground="#38bdf8",
-            background="#1e293b",
-        )
-        self.output_txt.tag_configure(
-            "table_body", font=("Consolas", 9), foreground="#e4e4e7"
-        )
+            self.after(80, self._init_sashes)
 
     def _update_cache_display(self):
         if self.cached_snippet:
@@ -808,58 +1537,389 @@ class LearnerApp(tk.Tk):
     def _sync_active_snippet_from_ui(self):
         if self.current_mode == "dissect":
             code = self.dissect_code_txt.get("1.0", tk.END).strip()
-            if code:
-                self.cached_snippet = code
+        elif self.current_mode == "compress":
+            code = self.compress_raw_txt.get("1.0", tk.END).strip()
         elif self.current_mode == "chat":
             code = self.chat_code_txt.get("1.0", tk.END).strip()
-            if code:
-                self.cached_snippet = code
         elif self.current_mode == "quiz":
             code = self.quiz_code_txt.get("1.0", tk.END).strip()
-            if code:
-                self.cached_snippet = code
+        else:
+            code = ""
+
+        if code:
+            self.cached_snippet = code
         self._update_cache_display()
+        self._save_session_state()
 
     def _clear_cached_snippet(self):
+        self._stop_autoscroll()
         self.cached_snippet = ""
         self.chat_history = []
+        self.current_chat_id = None
         self.active_concept_name = ""
         self.active_question = ""
         self.awaiting_quiz_answer = False
+        self._image_refs.clear()
         self._update_cache_display()
-        self.dissect_code_txt.delete("1.0", tk.END)
-        self.chat_code_txt.delete("1.0", tk.END)
-        self.chat_query_txt.delete("1.0", tk.END)
-        self.quiz_code_txt.delete("1.0", tk.END)
-        self.quiz_answer_txt.delete("1.0", tk.END)
+        self.btn_continue.pack_forget()
+
+        for w in self._panel_names:
+            was_disabled = w.cget("state") == "disabled"
+            if was_disabled:
+                w.config(state="normal")
+            w.delete("1.0", tk.END)
+            if was_disabled:
+                w.config(state="disabled")
+
         self.output_txt.config(state="normal")
-        self.output_txt.delete("1.0", tk.END)
         self.output_txt.insert(
             tk.END, "Session reset. Cache and chat memory cleared.\n", "quote"
         )
         self.output_txt.config(state="disabled")
+        self._save_session_state()
         self._set_status("Reset complete")
 
-    def _clear_chat_history(self):
+    def _save_session_state(self):
+        session_file = self.workspace_dir / "session.json"
+        state = {
+            "cached_snippet": self.cached_snippet,
+            "current_mode": self.current_mode,
+            "provider": self.provider_combo.get(),
+            "level_idx": self.level_combo.current(),
+            "current_chat_id": self.current_chat_id,
+        }
+        try:
+            with open(session_file, "w", encoding="utf-8") as f:
+                json.dump(state, f, indent=2)
+        except Exception:
+            pass
+
+    def _restore_session(self):
+        session_file = self.workspace_dir / "session.json"
+        if not session_file.exists():
+            return
+
+        try:
+            with open(session_file, "r", encoding="utf-8") as f:
+                state = json.load(f)
+
+            snip = state.get("cached_snippet", "")
+            if snip:
+                self.cached_snippet = snip
+                self._update_cache_display()
+                self.dissect_code_txt.insert(tk.END, snip)
+                self.chat_code_txt.insert(tk.END, snip)
+                self.quiz_code_txt.insert(tk.END, snip)
+                self.compress_raw_txt.insert(tk.END, snip)
+
+            mode = state.get("current_mode", "dissect")
+            if mode == "compress":
+                self._set_mode_compress()
+            elif mode == "chat":
+                self._set_mode_chat()
+            elif mode == "quiz":
+                self._set_mode_quiz()
+            else:
+                self._set_mode_dissect()
+
+            provider = state.get("provider")
+            if provider in PROVIDER_CHOICES:
+                self.provider_combo.set(provider)
+
+            lvl_idx = state.get("level_idx", 0)
+            if 0 <= lvl_idx < len(LEVEL_OPTIONS):
+                self.level_combo.current(lvl_idx)
+
+            chat_id = state.get("current_chat_id")
+            if chat_id:
+                self._load_chat_by_id(chat_id)
+        except Exception:
+            pass
+
+    def _save_current_chat(self):
+        if not self.chat_history:
+            return
+
+        if not self.current_chat_id:
+            self.current_chat_id = datetime.datetime.now().strftime(
+                "%Y%m%d_%H%M%S"
+            )
+
+        chat_file = (
+            self.workspace_dir / "chats" / f"{self.current_chat_id}.json"
+        )
+        title = "Chat Session"
+        for msg in self.chat_history:
+            if msg["role"] == "user":
+                content = msg["content"].split("\n")[-1][:40]
+                if content:
+                    title = content
+                    break
+
+        record = {
+            "id": self.current_chat_id,
+            "title": title,
+            "snippet": self.cached_snippet,
+            "history": self.chat_history,
+            "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+
+        try:
+            with open(chat_file, "w", encoding="utf-8") as f:
+                json.dump(record, f, indent=2)
+        except Exception:
+            pass
+
+    def _load_chat_by_id(self, chat_id: str):
+        chat_file = self.workspace_dir / "chats" / f"{chat_id}.json"
+        if not chat_file.exists():
+            return
+
+        try:
+            with open(chat_file, "r", encoding="utf-8") as f:
+                record = json.load(f)
+
+            self.current_chat_id = chat_id
+            self.chat_history = record.get("history", [])
+            snip = record.get("snippet", "")
+            if snip:
+                self.cached_snippet = snip
+                self._update_cache_display()
+                self.chat_code_txt.delete("1.0", tk.END)
+                self.chat_code_txt.insert(tk.END, snip)
+
+            self.output_txt.config(state="normal")
+            self.output_txt.delete("1.0", tk.END)
+            for msg in self.chat_history:
+                if msg["role"] == "user":
+                    clean = msg["content"]
+                    if "MY QUESTION:\n" in clean:
+                        clean = clean.split("MY QUESTION:\n")[-1]
+                    self.output_txt.insert(
+                        tk.END, f"\n\nYOU: {clean}\n", "chat_user_badge"
+                    )
+                else:
+                    self.output_txt.insert(
+                        tk.END, "\n" + "─" * 60 + "\n\n", "divider"
+                    )
+                    render_markdown(self.output_txt, msg["content"])
+            self.output_txt.config(state="disabled")
+            self.output_txt.see(tk.END)
+            self._set_status(f"Loaded Chat: {record.get('title')}")
+        except Exception as e:
+            self._handle_error(f"Failed to load chat: {e}")
+
+    def _start_new_chat(self):
+        self._save_current_chat()
+        self.current_chat_id = None
         self.chat_history = []
         self.output_txt.config(state="normal")
         self.output_txt.delete("1.0", tk.END)
         self.output_txt.insert(
-            tk.END, "Chat history cleared. Active snippet retained.\n", "quote"
+            tk.END,
+            "Started fresh Mentor Chat. Active snippet retained.\n",
+            "quote",
         )
         self.output_txt.config(state="disabled")
-        self._set_status("Chat history cleared")
+        self._set_status("New chat initialized")
+
+    def _open_chat_history_modal(self):
+        chats_dir = self.workspace_dir / "chats"
+        files = sorted(chats_dir.glob("*.json"), reverse=True)
+        if not files:
+            messagebox.showinfo(
+                "Chat History", "No saved conversations found in workspace."
+            )
+            return
+
+        modal = tk.Toplevel(self)
+        modal.title("Saved Chat History")
+        modal.geometry("520x400")
+        modal.configure(bg="#18181b")
+        modal.transient(self)
+        modal.grab_set()
+
+        tk.Label(
+            modal,
+            text="Saved Mentor Sessions",
+            bg="#18181b",
+            fg="#e4e4e7",
+            font=("Segoe UI", 11, "bold"),
+        ).pack(anchor="w", padx=14, pady=(12, 6))
+
+        box_frame = tk.Frame(modal, bg="#121214")
+        box_frame.pack(fill="both", expand=True, padx=14, pady=6)
+
+        listbox = tk.Listbox(
+            box_frame,
+            bg="#121214",
+            fg="#d4d4d8",
+            selectbackground="#3b82f6",
+            selectforeground="#ffffff",
+            relief="flat",
+            font=("Segoe UI", 10),
+        )
+        listbox.pack(side="left", fill="both", expand=True)
+
+        sc = ttk.Scrollbar(
+            box_frame,
+            orient="vertical",
+            command=listbox.yview,
+            style="Dark.Vertical.TScrollbar",
+        )
+        sc.pack(side="right", fill="y")
+        listbox.config(yscrollcommand=sc.set)
+
+        chat_map = []
+        for f in files:
+            try:
+                with open(f, "r", encoding="utf-8") as r:
+                    d = json.load(r)
+                cid = d.get("id", f.stem)
+                title = d.get("title", "Untitled")
+                tstamp = d.get("timestamp", "")
+                listbox.insert(tk.END, f"{tstamp}  •  {title}")
+                chat_map.append(cid)
+            except Exception:
+                pass
+
+        btn_box = tk.Frame(modal, bg="#18181b", padx=14, pady=12)
+        btn_box.pack(fill="x")
+
+        def on_load():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            chosen_id = chat_map[sel[0]]
+            self._set_mode_chat()
+            self._load_chat_by_id(chosen_id)
+            modal.destroy()
+
+        def on_delete():
+            sel = listbox.curselection()
+            if not sel:
+                return
+            chosen_id = chat_map[sel[0]]
+            cf = chats_dir / f"{chosen_id}.json"
+            if cf.exists():
+                cf.unlink()
+            modal.destroy()
+            self._open_chat_history_modal()
+
+        tk.Button(
+            btn_box,
+            text="Load Session",
+            bg="#8b5cf6",
+            fg="white",
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            command=on_load,
+        ).pack(side="right", padx=(6, 0))
+
+        tk.Button(
+            btn_box,
+            text="Delete",
+            bg="#ef4444",
+            fg="white",
+            relief="flat",
+            font=("Segoe UI", 9),
+            command=on_delete,
+        ).pack(side="right")
+
+    def _choose_workspace_dir(self):
+        chosen = filedialog.askdirectory(
+            initialdir=self.workspace_dir,
+            title="Select Local Workspace Cache Directory",
+        )
+        if chosen:
+            self.workspace_dir = Path(chosen)
+            self._init_workspace_dirs()
+            self._save_workspace_settings()
+            self._set_status(f"Workspace set: {self.workspace_dir.name}")
+
+    def _import_from_github(self):
+        url = simpledialog.askstring(
+            "Import from GitHub",
+            "Paste GitHub File or Raw URL:\n(e.g., [https://github.com/user/repo/blob/main/file.py](https://github.com/user/repo/blob/main/file.py))",
+            parent=self,
+        )
+        if not url:
+            return
+
+        url = url.strip()
+        if "github.com" in url and "/blob/" in url:
+            raw_url = url.replace("github.com", "raw.githubusercontent.com").replace(
+                "/blob/", "/"
+            )
+        elif "github.com" in url and "/raw/" in url:
+            raw_url = url.replace("github.com", "raw.githubusercontent.com").replace(
+                "/raw/", "/"
+            )
+        else:
+            raw_url = url
+
+        self._set_status("Fetching GitHub source...")
+
+        def worker():
+            try:
+                req = urllib.request.Request(
+                    raw_url, headers={"User-Agent": "SelfLearner/1.0"}
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    code_text = resp.read().decode("utf-8")
+
+                def update_ui():
+                    self.cached_snippet = code_text
+                    self._update_cache_display()
+
+                    if self.current_mode == "dissect":
+                        self.dissect_code_txt.delete("1.0", tk.END)
+                        self.dissect_code_txt.insert(tk.END, code_text)
+                    elif self.current_mode == "compress":
+                        self.compress_raw_txt.delete("1.0", tk.END)
+                        self.compress_raw_txt.insert(tk.END, code_text)
+                    elif self.current_mode == "chat":
+                        self.chat_code_txt.delete("1.0", tk.END)
+                        self.chat_code_txt.insert(tk.END, code_text)
+                    elif self.current_mode == "quiz":
+                        self.quiz_code_txt.delete("1.0", tk.END)
+                        self.quiz_code_txt.insert(tk.END, code_text)
+
+                    self._save_session_state()
+                    self._set_status(
+                        f"Imported {len(code_text.splitlines())} lines from GitHub."
+                    )
+
+                self.after(0, update_ui)
+            except Exception as e:
+                self.after(
+                    0,
+                    lambda: self._handle_error(
+                        f"GitHub Import Failed:\n{e}\nVerify the repo is public or URL is valid."
+                    ),
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _copy_compressed_code(self):
+        code = self.compress_code_txt.get("1.0", tk.END).strip()
+        if code:
+            self.clipboard_clear()
+            self.clipboard_append(code)
+            self._set_status("Compressed code copied to clipboard!")
 
     def _get_selected_provider(self) -> str:
         choice = self.provider_combo.get()
         return PROVIDER_CHOICES.get(choice, "auto")
 
     def _set_mode_dissect(self):
+        self._stop_autoscroll()
         self._sync_active_snippet_from_ui()
         self.current_mode = "dissect"
-        self.btn_dissect.config(bg="#3b82f6", fg="white")
-        self.btn_chat.config(bg="#3f3f46", fg="#d4d4d8")
-        self.btn_quiz.config(bg="#3f3f46", fg="#d4d4d8")
+        self._update_nav_buttons()
+
+        self.paned_compress.pack_forget()
+        self.paned_standard.pack(fill="both", expand=True, padx=8, pady=8)
 
         self.chat_left_bar.pack_forget()
         self.quiz_left_bar.pack_forget()
@@ -869,15 +1929,37 @@ class LearnerApp(tk.Tk):
         self.quiz_right_frame.pack_forget()
         self.dissect_right_frame.pack(fill="both", expand=True)
 
-        if self.cached_snippet and not self.dissect_code_txt.get("1.0", tk.END).strip():
+        if (
+            self.cached_snippet
+            and not self.dissect_code_txt.get("1.0", tk.END).strip()
+        ):
             self.dissect_code_txt.insert(tk.END, self.cached_snippet)
+        self._save_session_state()
+
+    def _set_mode_compress(self):
+        self._stop_autoscroll()
+        self._sync_active_snippet_from_ui()
+        self.current_mode = "compress"
+        self._update_nav_buttons()
+
+        self.paned_standard.pack_forget()
+        self.paned_compress.pack(fill="both", expand=True, padx=8, pady=8)
+
+        if (
+            self.cached_snippet
+            and not self.compress_raw_txt.get("1.0", tk.END).strip()
+        ):
+            self.compress_raw_txt.insert(tk.END, self.cached_snippet)
+        self._save_session_state()
 
     def _set_mode_chat(self):
+        self._stop_autoscroll()
         self._sync_active_snippet_from_ui()
         self.current_mode = "chat"
-        self.btn_chat.config(bg="#8b5cf6", fg="white")
-        self.btn_dissect.config(bg="#3f3f46", fg="#d4d4d8")
-        self.btn_quiz.config(bg="#3f3f46", fg="#d4d4d8")
+        self._update_nav_buttons()
+
+        self.paned_compress.pack_forget()
+        self.paned_standard.pack(fill="both", expand=True, padx=8, pady=8)
 
         self.dissect_left_bar.pack_forget()
         self.quiz_left_bar.pack_forget()
@@ -887,15 +1969,21 @@ class LearnerApp(tk.Tk):
         self.quiz_right_frame.pack_forget()
         self.chat_right_frame.pack(fill="both", expand=True)
 
-        if self.cached_snippet and not self.chat_code_txt.get("1.0", tk.END).strip():
+        if (
+            self.cached_snippet
+            and not self.chat_code_txt.get("1.0", tk.END).strip()
+        ):
             self.chat_code_txt.insert(tk.END, self.cached_snippet)
+        self._save_session_state()
 
     def _set_mode_quiz(self):
+        self._stop_autoscroll()
         self._sync_active_snippet_from_ui()
         self.current_mode = "quiz"
-        self.btn_quiz.config(bg="#10b981", fg="white")
-        self.btn_dissect.config(bg="#3f3f46", fg="#d4d4d8")
-        self.btn_chat.config(bg="#3f3f46", fg="#d4d4d8")
+        self._update_nav_buttons()
+
+        self.paned_compress.pack_forget()
+        self.paned_standard.pack(fill="both", expand=True, padx=8, pady=8)
 
         self.dissect_left_bar.pack_forget()
         self.chat_left_bar.pack_forget()
@@ -905,8 +1993,25 @@ class LearnerApp(tk.Tk):
         self.chat_right_frame.pack_forget()
         self.quiz_right_frame.pack(fill="both", expand=True)
 
-        if self.cached_snippet and not self.quiz_code_txt.get("1.0", tk.END).strip():
+        if (
+            self.cached_snippet
+            and not self.quiz_code_txt.get("1.0", tk.END).strip()
+        ):
             self.quiz_code_txt.insert(tk.END, self.cached_snippet)
+        self._save_session_state()
+
+    def _update_nav_buttons(self):
+        modes = [
+            ("dissect", self.btn_dissect, "#3b82f6"),
+            ("compress", self.btn_compress, "#e11d48"),
+            ("chat", self.btn_chat, "#8b5cf6"),
+            ("quiz", self.btn_quiz, "#10b981"),
+        ]
+        for name, btn, active_color in modes:
+            if self.current_mode == name:
+                btn.config(bg=active_color, fg="white")
+            else:
+                btn.config(bg="#3f3f46", fg="#d4d4d8")
 
     def _set_status(self, text: str):
         self.status_lbl.config(text=text)
@@ -936,11 +2041,44 @@ class LearnerApp(tk.Tk):
 
         self.output_txt.insert(tk.END, "─" * 60 + "\n", "divider")
         render_markdown(self.output_txt, raw_markdown)
+
+        if self.current_mode == "dissect":
+            self.output_txt.insert(tk.END, "\n\n")
+            btn_diag = tk.Button(
+                self.output_txt,
+                text="📊 Generate Dataflow Diagram (Mermaid)",
+                bg="#1e293b",
+                fg="#38bdf8",
+                activebackground="#3b82f6",
+                activeforeground="#ffffff",
+                relief="flat",
+                font=("Segoe UI", 9, "bold"),
+                padx=10,
+                pady=5,
+                cursor="hand2",
+            )
+            btn_diag.config(
+                command=lambda b=btn_diag: self._trigger_generate_diagram(b)
+            )
+            self.output_txt.window_create(tk.END, window=btn_diag)
+            self.output_txt.insert(tk.END, "\n\n")
+
+        if meta.get("truncated"):
+            self.output_txt.insert(
+                tk.END,
+                "\n\n[⚠️ Note: Output was truncated by the model's token limit. Click 'Continue Output' above to proceed.]\n",
+                "meta_trail",
+            )
+            self.btn_continue.pack(side="left", padx=8)
+        else:
+            self.btn_continue.pack_forget()
+
         self.output_txt.config(state="disabled")
         self.output_txt.see(tk.END)
         self._set_status(f"Resolved: {provider} ({model})")
 
     def _on_action_click(self):
+        self._stop_autoscroll()
         if self.current_mode == "dissect":
             text = self.dissect_code_txt.get("1.0", tk.END).strip()
             if text:
@@ -950,6 +2088,16 @@ class LearnerApp(tk.Tk):
                 self._display_error("Paste code in the right pane to dissect.")
                 return
             self._trigger_dissect(self.cached_snippet)
+
+        elif self.current_mode == "compress":
+            text = self.compress_raw_txt.get("1.0", tk.END).strip()
+            if text:
+                self.cached_snippet = text
+                self._update_cache_display()
+            if not self.cached_snippet:
+                self._display_error("Paste code in the left pane to compress.")
+                return
+            self._trigger_compress(self.cached_snippet)
 
         elif self.current_mode == "chat":
             self._trigger_chat_send()
@@ -994,7 +2142,253 @@ class LearnerApp(tk.Tk):
             except Exception as e:
                 self.after(0, lambda: self._handle_error(str(e)))
             finally:
-                self.after(0, lambda: self.btn_run_dissect.config(state="normal"))
+                self.after(
+                    0, lambda: self.btn_run_dissect.config(state="normal")
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _trigger_generate_diagram(self, button_widget: tk.Button):
+        if not self.cached_snippet:
+            return
+
+        provider = self._get_selected_provider()
+        button_widget.config(
+            text="⏳ Rendering Mermaid Diagram...",
+            state="disabled",
+            bg="#27272a",
+            fg="#a1a1aa",
+        )
+        self._set_status("Synthesizing architecture diagram...")
+
+        def worker():
+            try:
+                diagram_res = generate_dataflow_diagram(
+                    self.cached_snippet, provider=provider
+                )
+
+                mermaid_code = ""
+                if "```mermaid" in diagram_res:
+                    mermaid_code = (
+                        diagram_res.split("```mermaid", 1)[1]
+                        .split("```", 1)[0]
+                        .strip()
+                    )
+                elif "```" in diagram_res:
+                    mermaid_code = (
+                        diagram_res.split("```", 1)[1]
+                        .split("```", 1)[0]
+                        .strip()
+                    )
+                else:
+                    mermaid_code = diagram_res.strip()
+
+                clean_mermaid = sanitize_mermaid(mermaid_code)
+                png_bytes, local_svg_file, local_bridge_file = fetch_diagram_data(
+                    clean_mermaid, self.workspace_dir
+                )
+
+                def ui_render():
+                    self.output_txt.config(state="normal")
+                    self.output_txt.insert(
+                        tk.END, "\n### ARCHITECTURAL DATAFLOW\n\n", "h3"
+                    )
+
+                    rendered_image = False
+                    if png_bytes:
+                        try:
+                            if HAS_PIL:
+                                img = Image.open(io.BytesIO(png_bytes))
+                                if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                                    bg_img = Image.new("RGBA", img.size, (24, 24, 27, 255))
+                                    bg_img.paste(img, (0, 0), img.convert("RGBA"))
+                                    img = bg_img.convert("RGB")
+
+                                max_w = min(560, max(300, self.output_txt.winfo_width() - 40))
+                                if img.width > max_w:
+                                    ratio = max_w / float(img.width)
+                                    new_h = int(float(img.height) * ratio)
+                                    img = img.resize((max_w, new_h), Image.Resampling.LANCZOS)
+                                photo = ImageTk.PhotoImage(img)
+                            else:
+                                photo = tk.PhotoImage(data=base64.b64encode(png_bytes))
+
+                            self._image_refs.append(photo)
+                            self.output_txt.image_create(tk.END, image=photo)
+                            self.output_txt.insert(tk.END, "\n\n")
+                            rendered_image = True
+                        except Exception:
+                            rendered_image = False
+
+                    # Embedded control buttons
+                    btn_open_live = tk.Button(
+                        self.output_txt,
+                        text="🔍 Open in Mermaid Live Editor",
+                        bg="#0f172a",
+                        fg="#38bdf8",
+                        activebackground="#1e293b",
+                        activeforeground="#ffffff",
+                        relief="flat",
+                        font=("Segoe UI", 9, "bold"),
+                        padx=8,
+                        pady=4,
+                        cursor="hand2",
+                        command=lambda f=local_bridge_file: webbrowser.open(f.as_uri()),
+                    )
+                    self.output_txt.window_create(tk.END, window=btn_open_live)
+
+                    btn_open_svg = tk.Button(
+                        self.output_txt,
+                        text="🌐 Open Vector SVG",
+                        bg="#18181b",
+                        fg="#a1a1aa",
+                        activebackground="#27272a",
+                        activeforeground="#ffffff",
+                        relief="flat",
+                        font=("Segoe UI", 9),
+                        padx=8,
+                        pady=4,
+                        cursor="hand2",
+                        command=lambda f=local_svg_file: webbrowser.open(f.as_uri()),
+                    )
+                    self.output_txt.insert(tk.END, "  ")
+                    self.output_txt.window_create(tk.END, window=btn_open_svg)
+                    self.output_txt.insert(tk.END, "\n\n")
+
+                    # Only show raw text fallback if image could not be rendered
+                    if not rendered_image:
+                        render_markdown(
+                            self.output_txt,
+                            f"```mermaid\n{clean_mermaid}\n```\n",
+                        )
+
+                    if "```" in diagram_res:
+                        caption_parts = diagram_res.split("```")
+                        if len(caption_parts) >= 3 and caption_parts[2].strip():
+                            render_markdown(
+                                self.output_txt,
+                                f"> {caption_parts[2].strip()}\n\n",
+                            )
+
+                    button_widget.config(
+                        text="✓ Diagram Rendered",
+                        bg="#065f46",
+                        fg="#6ee7b7",
+                        state="disabled",
+                    )
+
+                    self.output_txt.config(state="disabled")
+                    self.output_txt.see(tk.END)
+                    self._set_status(f"Dataflow generated via {provider}")
+
+                self.after(0, ui_render)
+            except Exception as e:
+                def ui_fail(err_msg=str(e)):
+                    button_widget.config(
+                        text="⚠️ Diagram Generation Failed",
+                        state="normal",
+                        bg="#ef4444",
+                        fg="#ffffff",
+                    )
+                    self._set_status(f"Diagram error: {err_msg}")
+                    self.output_txt.config(state="normal")
+                    self.output_txt.insert(
+                        tk.END,
+                        f"\n[⚠️ Diagram error: {err_msg}]\n",
+                        "meta_trail",
+                    )
+                    self.output_txt.config(state="disabled")
+                    self.output_txt.see(tk.END)
+
+                self.after(0, ui_fail)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _trigger_compress(self, code: str):
+        provider = self._get_selected_provider()
+        self.btn_run_compress.config(state="disabled")
+        self._set_status(f"Compressing via {provider}...")
+
+        self.compress_audit_txt.config(state="normal")
+        self.compress_audit_txt.delete("1.0", tk.END)
+        self.compress_audit_txt.insert(
+            tk.END, "Auditing transformations...\n", "quote"
+        )
+        self.compress_audit_txt.config(state="disabled")
+
+        self.compress_code_txt.config(state="normal")
+        self.compress_code_txt.delete("1.0", tk.END)
+        self.compress_code_txt.config(state="disabled")
+
+        def worker():
+            try:
+                audit, comp_code = compress_code(code, provider=provider)
+                meta = get_last_call_info()
+
+                def ui():
+                    self.compress_audit_txt.config(state="normal")
+                    self.compress_audit_txt.delete("1.0", tk.END)
+                    render_markdown(self.compress_audit_txt, audit)
+                    if meta.get("truncated"):
+                        self.compress_audit_txt.insert(
+                            tk.END,
+                            "\n\n[⚠️ Note: Truncated. Click 'Continue Output' to resume.]\n",
+                            "meta_trail",
+                        )
+                        self.btn_continue.pack(side="left", padx=8)
+                    else:
+                        self.btn_continue.pack_forget()
+                    self.compress_audit_txt.config(state="disabled")
+
+                    self.compress_code_txt.config(state="normal")
+                    self.compress_code_txt.delete("1.0", tk.END)
+                    self.compress_code_txt.insert(tk.END, comp_code)
+                    self.compress_code_txt.config(state="disabled")
+                    self._set_status(f"Compressed via {provider}")
+
+                self.after(0, ui)
+            except Exception as e:
+                self.after(0, lambda: self._handle_error(str(e)))
+            finally:
+                self.after(
+                    0, lambda: self.btn_run_compress.config(state="normal")
+                )
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _trigger_continue(self):
+        provider = self._get_selected_provider()
+        self.btn_continue.config(state="disabled")
+        self._set_status("Continuing stream...")
+
+        def worker():
+            try:
+                continued_chunk = call_continue(provider=provider)
+                meta = get_last_call_info()
+
+                def ui():
+                    if self.current_mode == "compress":
+                        self.compress_audit_txt.config(state="normal")
+                        self.compress_audit_txt.insert(
+                            tk.END, "\n" + continued_chunk
+                        )
+                        if not meta.get("truncated"):
+                            self.btn_continue.pack_forget()
+                        self.compress_audit_txt.config(state="disabled")
+                    else:
+                        self.output_txt.config(state="normal")
+                        self.output_txt.insert(tk.END, "\n" + continued_chunk)
+                        if not meta.get("truncated"):
+                            self.btn_continue.pack_forget()
+                        self.output_txt.config(state="disabled")
+
+                    self._set_status("Continued response appended.")
+
+                self.after(0, ui)
+            except Exception as e:
+                self.after(0, lambda: self._handle_error(str(e)))
+            finally:
+                self.after(0, lambda: self.btn_continue.config(state="normal"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1053,6 +2447,7 @@ class LearnerApp(tk.Tk):
                 self.chat_history.append(
                     {"role": "assistant", "content": response}
                 )
+                self._save_current_chat()
                 meta = get_last_call_info()
 
                 def ui_update():
@@ -1116,11 +2511,11 @@ class LearnerApp(tk.Tk):
                 )
 
                 def ui_update():
-                    self._display_formatted_response(
-                        preview, meta, append=False
-                    )
+                    self._display_formatted_response(preview, meta, append=False)
                     self.awaiting_quiz_answer = True
-                    self.quiz_mid_lbl.config(text="TYPE YOUR ANSWER BELOW (INPUT):")
+                    self.quiz_mid_lbl.config(
+                        text="TYPE YOUR ANSWER BELOW (INPUT):"
+                    )
                     self.btn_quiz_action.config(
                         text="Submit", bg="#10b981", state="normal"
                     )
@@ -1129,7 +2524,9 @@ class LearnerApp(tk.Tk):
                 self.after(0, ui_update)
             except Exception as e:
                 self.after(0, lambda: self._handle_error(str(e)))
-                self.after(0, lambda: self.btn_quiz_action.config(state="normal"))
+                self.after(
+                    0, lambda: self.btn_quiz_action.config(state="normal")
+                )
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -1173,9 +2570,7 @@ class LearnerApp(tk.Tk):
                     )
 
                 def ui_update():
-                    self._display_formatted_response(
-                        output, meta, append=False
-                    )
+                    self._display_formatted_response(output, meta, append=False)
                     self.awaiting_quiz_answer = False
                     self.quiz_mid_lbl.config(
                         text="YOUR ANSWER (Submit after generating challenge):"
@@ -1189,8 +2584,12 @@ class LearnerApp(tk.Tk):
                 self.after(0, ui_update)
             except Exception as e:
                 self.after(0, lambda: self._handle_error(str(e)))
-                self.after(0, lambda: self.btn_quiz_action.config(state="normal"))
-                self.after(0, lambda: self.btn_quiz_submit.config(state="normal"))
+                self.after(
+                    0, lambda: self.btn_quiz_action.config(state="normal")
+                )
+                self.after(
+                    0, lambda: self.btn_quiz_submit.config(state="normal")
+                )
 
         threading.Thread(target=worker, daemon=True).start()
 
