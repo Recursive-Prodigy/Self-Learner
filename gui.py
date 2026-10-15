@@ -14,6 +14,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
+import zipfile
 import zlib
 
 try:
@@ -84,7 +85,10 @@ def get_ssl_context():
 
 
 def sanitize_mermaid(raw_code: str) -> str:
-    """Sanitizes raw Mermaid syntax so external parsers and compilers do not fail."""
+    """Sanitizes raw Mermaid syntax and enforces high-visibility white connector
+
+    lines across all external rendering engines.
+    """
     code = raw_code.strip()
     code = re.sub(r"^```(?:mermaid)?", "", code, flags=re.MULTILINE)
     code = re.sub(r"```$", "", code, flags=re.MULTILINE)
@@ -125,33 +129,47 @@ def sanitize_mermaid(raw_code: str) -> str:
     if not has_header:
         lines.insert(0, "flowchart TD")
 
-    return "\n".join(lines)
+    # Force all connector links to render bright white
+    lines.append("    linkStyle default stroke:#ffffff,stroke-width:2.5px;")
+
+    # Prepend dark theme directive with white line and arrow styling
+    init_header = '%%{init: {"theme": "dark", "themeVariables": {"darkMode": true, "lineColor": "#ffffff", "arrowheadColor": "#ffffff", "primaryColor": "#1e293b", "primaryTextColor": "#ffffff", "primaryBorderColor": "#60a5fa"}}}%%'
+    return init_header + "\n" + "\n".join(lines)
 
 
 def enhance_svg_dark_contrast(svg_text: str) -> str:
-    """Injects high-contrast CSS and replaces dark strokes with electric blue (#60a5fa)
+    """Injects an explicit dark background (#18181b) and forces all link paths,
 
-    so connecting lines and arrowheads are clearly visible on dark backgrounds.
+    arrowheads, and text to high-contrast white so the SVG displays properly in browsers.
     """
     custom_style = """
     <style>
-      .edgePaths path, .flowchart-link, path.path { stroke: #60a5fa !important; stroke-width: 2.5px !important; }
-      .marker, marker path, #flowchart-pointEnd, #flowchart-pointStart { fill: #60a5fa !important; stroke: #60a5fa !important; }
-      .edgeLabel { color: #93c5fd !important; background-color: #18181b !important; }
+      svg { background-color: #18181b !important; }
+      .edgePaths path, .flowchart-link, path.path { stroke: #ffffff !important; stroke-width: 2.5px !important; }
+      .marker, marker path, #flowchart-pointEnd, #flowchart-pointStart { fill: #ffffff !important; stroke: #ffffff !important; }
+      .edgeLabel { color: #ffffff !important; background-color: #18181b !important; }
       .edgeLabel rect { fill: #18181b !important; opacity: 0.85 !important; }
-      .edgeLabel span { color: #93c5fd !important; background-color: #18181b !important; padding: 2px 4px; border-radius: 4px; }
+      .edgeLabel span { color: #ffffff !important; background-color: #18181b !important; padding: 2px 4px; border-radius: 4px; }
       .node rect, .node circle, .node polygon { stroke-width: 2px !important; }
     </style>
     """
     if "<svg" in svg_text:
-        svg_text = re.sub(r'(<svg[^>]*>)', r'\1' + custom_style, svg_text, count=1)
+        def inject_svg_attrs(match):
+            tag = match.group(0)
+            if "style=" in tag:
+                tag = re.sub(r'style="([^"]*)"', r'style="background-color: #18181b; \1"', tag)
+            else:
+                tag = tag[:-1] + ' style="background-color: #18181b;">'
+            return tag + custom_style
 
-    # Replace legacy black/dark gray strokes on paths and arrows
-    svg_text = re.sub(r'stroke="#333333"', 'stroke="#60a5fa"', svg_text)
-    svg_text = re.sub(r'stroke="#333"', 'stroke="#60a5fa"', svg_text)
-    svg_text = re.sub(r'stroke="black"', 'stroke="#60a5fa"', svg_text)
-    svg_text = re.sub(r'fill="#333333"', 'fill="#60a5fa"', svg_text)
-    svg_text = re.sub(r'fill="#333"', 'fill="#60a5fa"', svg_text)
+        svg_text = re.sub(r'(<svg[^>]*>)', inject_svg_attrs, svg_text, count=1)
+
+    # Overwrite legacy dark strokes and fills with white
+    svg_text = re.sub(r'stroke="#333333"', 'stroke="#ffffff"', svg_text)
+    svg_text = re.sub(r'stroke="#333"', 'stroke="#ffffff"', svg_text)
+    svg_text = re.sub(r'stroke="black"', 'stroke="#ffffff"', svg_text)
+    svg_text = re.sub(r'fill="#333333"', 'fill="#ffffff"', svg_text)
+    svg_text = re.sub(r'fill="#333"', 'fill="#ffffff"', svg_text)
     return svg_text
 
 
@@ -210,21 +228,14 @@ def fetch_diagram_data(clean_code: str, workspace_dir: Path) -> tuple[bytes | No
         svg_text = enhance_svg_dark_contrast(svg_text)
         local_svg_path.write_text(svg_text, encoding="utf-8")
     else:
-        fallback_svg = f"""<svg xmlns="http://www.w3.org/2000/svg" width="600" height="200" style="background:#18181b">
+        fallback_svg = """<svg xmlns="http://www.w3.org/2000/svg" width="600" height="200" style="background:#18181b">
         <text x="30" y="50" fill="#38bdf8" font-family="monospace" font-size="14">Mermaid Diagram Generated</text>
         <text x="30" y="90" fill="#a1a1aa" font-family="monospace" font-size="12">Open Mermaid Live Editor to view full interactive diagram.</text>
         </svg>"""
         local_svg_path.write_text(fallback_svg, encoding="utf-8")
 
     # Step B: Render / Fetch PNG Bytes for In-App Display
-    # Option 1: Local CairoSVG rasterization (instant, no network)
-    if HAS_CAIROSVG and svg_text:
-        try:
-            png_data = cairosvg.svg2png(bytestring=svg_text.encode("utf-8"))
-        except Exception:
-            pass
-
-    # Option 2: QuickChart JSON POST (with format="png")
+    # Option 1: QuickChart JSON POST
     if not png_data:
         try:
             payload = json.dumps({
@@ -246,7 +257,7 @@ def fetch_diagram_data(clean_code: str, workspace_dir: Path) -> tuple[bytes | No
         except Exception:
             pass
 
-    # Option 3: Mermaid.ink pako PNG request
+    # Option 2: Mermaid.ink pako PNG request
     if not png_data:
         try:
             pako_str = encode_mermaid_live_pako(clean_code)
@@ -259,7 +270,7 @@ def fetch_diagram_data(clean_code: str, workspace_dir: Path) -> tuple[bytes | No
         except Exception:
             pass
 
-    # Option 4: Kroki Plain Text POST
+    # Option 3: Kroki Plain Text POST
     if not png_data:
         try:
             req = urllib.request.Request(
@@ -504,22 +515,20 @@ class LearnerApp(tk.Tk):
         except Exception:
             pass
 
+        # Dark styling for Project Explorer Treeview
         self.style.configure(
-            "Dark.Vertical.TScrollbar",
-            gripcount=0,
-            background="#333336",
-            darkcolor="#18181b",
-            lightcolor="#18181b",
-            troughcolor="#18181b",
-            bordercolor="#18181b",
-            arrowcolor="#71717a",
-            relief="flat",
-            arrowsize=10,
+            "Treeview",
+            background="#121214",
+            foreground="#d4d4d8",
+            fieldbackground="#121214",
+            borderwidth=0,
+            font=("Segoe UI", 9),
+            rowheight=22,
         )
         self.style.map(
-            "Dark.Vertical.TScrollbar",
-            background=[("active", "#4e4e52"), ("disabled", "#222225")],
-            arrowcolor=[("active", "#ffffff")],
+            "Treeview",
+            background=[("selected", "#2563eb")],
+            foreground=[("selected", "#ffffff")],
         )
 
         self.style.configure(
@@ -627,6 +636,7 @@ class LearnerApp(tk.Tk):
         )
         self.btn_clear_cache.pack(side="left", padx=2)
 
+        # GitHub Importer Button
         self.btn_gh_import = tk.Button(
             nav_frame,
             text="🌐 Import GitHub",
@@ -638,6 +648,19 @@ class LearnerApp(tk.Tk):
             command=self._import_from_github,
         )
         self.btn_gh_import.pack(side="left", padx=6)
+
+        # API Keys Management Button
+        self.btn_api_keys = tk.Button(
+            nav_frame,
+            text="🔑 API Keys",
+            bg="#18181b",
+            fg="#a78bfa",
+            relief="flat",
+            font=("Segoe UI", 8, "bold"),
+            padx=6,
+            command=self._open_api_keys_modal,
+        )
+        self.btn_api_keys.pack(side="left", padx=2)
 
         self.btn_workspace = tk.Button(
             nav_frame,
@@ -1826,6 +1849,150 @@ class LearnerApp(tk.Tk):
             command=on_delete,
         ).pack(side="right")
 
+    def _open_api_keys_modal(self):
+        """Opens a modal to view, edit, and persist provider API keys to .env and active runtime."""
+        import os
+
+        env_file = BASE_DIR / ".env"
+
+        # Read existing .env keys if present
+        env_keys = {}
+        if env_file.exists():
+            try:
+                for line in env_file.read_text(encoding="utf-8").splitlines():
+                    line = line.strip()
+                    if line and not line.startswith("#") and "=" in line:
+                        k, v = line.split("=", 1)
+                        env_keys[k.strip()] = v.strip().strip('"').strip("'")
+            except Exception:
+                pass
+
+        key_fields = [
+            ("Groq API Key", "GROQ_API_KEY"),
+            ("Gemini API Key", "GEMINI_API_KEY"),
+            ("OpenAI API Key", "OPENAI_API_KEY"),
+            ("Anthropic / Claude Key", "ANTHROPIC_API_KEY"),
+            ("OpenRouter API Key", "OPENROUTER_API_KEY"),
+        ]
+
+        modal = tk.Toplevel(self)
+        modal.title("Configure API Keys")
+        modal.geometry("540x430")
+        modal.configure(bg="#18181b")
+        modal.transient(self)
+        modal.grab_set()
+
+        tk.Label(
+            modal,
+            text="Provider API Keys",
+            bg="#18181b",
+            fg="#e4e4e7",
+            font=("Segoe UI", 12, "bold"),
+        ).pack(anchor="w", padx=16, pady=(14, 4))
+
+        tk.Label(
+            modal,
+            text="Keys are saved locally in .env and loaded immediately into the active session.",
+            bg="#18181b",
+            fg="#71717a",
+            font=("Segoe UI", 8),
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        entries = {}
+        container = tk.Frame(modal, bg="#18181b")
+        container.pack(fill="both", expand=True, padx=16)
+
+        for label_text, env_var in key_fields:
+            row = tk.Frame(container, bg="#18181b")
+            row.pack(fill="x", pady=5)
+
+            tk.Label(
+                row,
+                text=label_text,
+                bg="#18181b",
+                fg="#a1a1aa",
+                font=("Segoe UI", 9, "bold"),
+                width=20,
+                anchor="w",
+            ).pack(side="left")
+
+            entry = tk.Entry(
+                row,
+                bg="#121214",
+                fg="#f4f4f5",
+                insertbackground="white",
+                relief="flat",
+                show="*",
+                font=("Consolas", 9),
+            )
+            # Preload from runtime environment or .env file
+            current_val = os.environ.get(env_var) or env_keys.get(env_var, "")
+            entry.insert(0, current_val)
+            entry.pack(side="left", fill="x", expand=True, ipady=4, padx=(4, 6))
+
+            # Quick show/hide toggle button
+            def toggle_show(e=entry):
+                e.config(show="" if e.cget("show") == "*" else "*")
+
+            t_btn = tk.Button(
+                row,
+                text="👁",
+                bg="#27272a",
+                fg="#a1a1aa",
+                relief="flat",
+                font=("Segoe UI", 8),
+                command=toggle_show,
+            )
+            t_btn.pack(side="right")
+            entries[env_var] = entry
+
+        btn_bar = tk.Frame(modal, bg="#18181b", padx=16, pady=16)
+        btn_bar.pack(fill="x")
+
+        def save_keys():
+            # Update running environment immediately
+            for env_var, entry_widget in entries.items():
+                val = entry_widget.get().strip()
+                if val:
+                    os.environ[env_var] = val
+                    env_keys[env_var] = val
+                elif env_var in os.environ and not val:
+                    del os.environ[env_var]
+                    env_keys.pop(env_var, None)
+
+            # Persist to local .env
+            lines = [f"{k}={v}" for k, v in env_keys.items()]
+            try:
+                env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+                self._set_status("API keys updated and saved to .env")
+                modal.destroy()
+            except Exception as e:
+                messagebox.showerror("Error Saving", f"Failed to write .env: {e}", parent=modal)
+
+        tk.Button(
+            btn_bar,
+            text="Save Keys",
+            bg="#8b5cf6",
+            fg="white",
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=4,
+            command=save_keys,
+        ).pack(side="right")
+
+        tk.Button(
+            btn_bar,
+            text="Cancel",
+            bg="#27272a",
+            fg="#a1a1aa",
+            relief="flat",
+            font=("Segoe UI", 9),
+            padx=10,
+            pady=4,
+            command=modal.destroy,
+        ).pack(side="right", padx=(0, 8))
+
     def _choose_workspace_dir(self):
         chosen = filedialog.askdirectory(
             initialdir=self.workspace_dir,
@@ -1838,68 +2005,328 @@ class LearnerApp(tk.Tk):
             self._set_status(f"Workspace set: {self.workspace_dir.name}")
 
     def _import_from_github(self):
+        """Imports either a single file OR an entire repository into workspace_data/repos/
+
+        and launches the interactive Project Explorer.
+        """
         url = simpledialog.askstring(
             "Import from GitHub",
-            "Paste GitHub File or Raw URL:\n(e.g., [https://github.com/user/repo/blob/main/file.py](https://github.com/user/repo/blob/main/file.py))",
+            "Paste GitHub Repository or File URL:\n\n"
+            "• Entire Project:  https://github.com/owner/repo\n"
+            "• Single File:     https://github.com/owner/repo/blob/main/file.py",
             parent=self,
         )
         if not url:
             return
 
         url = url.strip()
-        if "github.com" in url and "/blob/" in url:
-            raw_url = url.replace("github.com", "raw.githubusercontent.com").replace(
-                "/blob/", "/"
-            )
-        elif "github.com" in url and "/raw/" in url:
-            raw_url = url.replace("github.com", "raw.githubusercontent.com").replace(
-                "/raw/", "/"
-            )
-        else:
-            raw_url = url
 
-        self._set_status("Fetching GitHub source...")
+        # Check if the URL points to a specific single file
+        code_exts = (".py", ".js", ".ts", ".html", ".css", ".json", ".sql", ".rs", ".go", ".c", ".cpp", ".java", ".sh")
+        is_single_file = "/blob/" in url or "/raw/" in url or any(url.endswith(ext) for ext in code_exts)
+
+        if is_single_file:
+            self._import_single_github_file(url)
+        else:
+            self._import_github_repository(url)
+
+    def _import_single_github_file(self, url: str):
+        raw_url = url
+        if "github.com" in url and "/blob/" in url:
+            raw_url = url.replace("github.com", "raw.githubusercontent.com").replace("/blob/", "/")
+        elif "github.com" in url and "/raw/" in url:
+            raw_url = url.replace("github.com", "raw.githubusercontent.com").replace("/raw/", "/")
+
+        self._set_status("Fetching single GitHub file...")
 
         def worker():
             try:
-                req = urllib.request.Request(
-                    raw_url, headers={"User-Agent": "SelfLearner/1.0"}
-                )
-                with urllib.request.urlopen(req, timeout=15) as resp:
-                    code_text = resp.read().decode("utf-8")
+                req = urllib.request.Request(raw_url, headers={"User-Agent": "SelfLearner/1.0"})
+                with urllib.request.urlopen(req, timeout=15, context=get_ssl_context()) as resp:
+                    code_text = resp.read().decode("utf-8", errors="replace")
 
                 def update_ui():
-                    self.cached_snippet = code_text
-                    self._update_cache_display()
-
-                    if self.current_mode == "dissect":
-                        self.dissect_code_txt.delete("1.0", tk.END)
-                        self.dissect_code_txt.insert(tk.END, code_text)
-                    elif self.current_mode == "compress":
-                        self.compress_raw_txt.delete("1.0", tk.END)
-                        self.compress_raw_txt.insert(tk.END, code_text)
-                    elif self.current_mode == "chat":
-                        self.chat_code_txt.delete("1.0", tk.END)
-                        self.chat_code_txt.insert(tk.END, code_text)
-                    elif self.current_mode == "quiz":
-                        self.quiz_code_txt.delete("1.0", tk.END)
-                        self.quiz_code_txt.insert(tk.END, code_text)
-
-                    self._save_session_state()
-                    self._set_status(
-                        f"Imported {len(code_text.splitlines())} lines from GitHub."
-                    )
+                    self._load_code_into_active_mode(code_text)
+                    self._set_status(f"Imported single file ({len(code_text.splitlines())} lines).")
 
                 self.after(0, update_ui)
             except Exception as e:
-                self.after(
-                    0,
-                    lambda: self._handle_error(
-                        f"GitHub Import Failed:\n{e}\nVerify the repo is public or URL is valid."
-                    ),
-                )
+                self.after(0, lambda: self._handle_error(f"GitHub Single File Import Failed:\n{e}"))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _import_github_repository(self, url: str):
+        match = re.search(r"github\.com/([^/]+)/([^/]+)", url)
+        if not match:
+            self._display_error("Invalid GitHub URL format. Use https://github.com/owner/repo")
+            return
+
+        owner = match.group(1)
+        repo = match.group(2).replace(".git", "")
+        repo_name = f"{owner}_{repo}"
+        repo_dir = self.workspace_dir / "repos" / repo_name
+
+        self._set_status(f"Downloading {owner}/{repo} repository archive...")
+
+        def worker():
+            try:
+                # Download full repository zipball (auto-resolves default branch)
+                zip_urls = [
+                    f"https://api.github.com/repos/{owner}/{repo}/zipball",
+                    f"https://github.com/{owner}/{repo}/archive/HEAD.zip",
+                ]
+
+                zip_data = None
+                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SelfLearner/1.0"}
+                ssl_ctx = get_ssl_context()
+
+                for z_url in zip_urls:
+                    try:
+                        req = urllib.request.Request(z_url, headers=headers)
+                        with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
+                            zip_data = resp.read()
+                            if zip_data.startswith(b"PK"):
+                                break
+                    except Exception:
+                        continue
+
+                if not zip_data or not zip_data.startswith(b"PK"):
+                    raise RuntimeError("Could not download valid repository archive. Verify repo is public.")
+
+                # Extract and strip GitHub's root hash directory
+                repo_dir.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
+                    namelist = z.namelist()
+                    root_prefix = namelist[0].split("/")[0] if namelist else ""
+                    for member in z.infolist():
+                        rel = member.filename
+                        if root_prefix and rel.startswith(root_prefix + "/"):
+                            rel = rel[len(root_prefix) + 1:]
+                        if not rel:
+                            continue
+                        target = repo_dir / rel
+                        if member.is_dir():
+                            target.mkdir(parents=True, exist_ok=True)
+                        else:
+                            target.parent.mkdir(parents=True, exist_ok=True)
+                            with z.open(member) as src, open(target, "wb") as dst:
+                                dst.write(src.read())
+
+                self.after(0, lambda: self._open_repo_explorer_modal(repo_dir, f"{owner}/{repo}"))
+                self.after(0, lambda: self._set_status(f"Project loaded: {owner}/{repo}"))
+            except Exception as e:
+                self.after(0, lambda: self._handle_error(f"Repository Clone Failed:\n{e}"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _open_repo_explorer_modal(self, repo_dir: Path, repo_title: str):
+        """Displays an interactive Project File Tree with syntax preview,
+
+        single-file loading, and multi-file cross-module bundling.
+        """
+        modal = tk.Toplevel(self)
+        modal.title(f"Project Explorer — {repo_title}")
+        modal.geometry("960x640")
+        modal.configure(bg="#18181b")
+        modal.transient(self)
+        modal.grab_set()
+
+        top_bar = tk.Frame(modal, bg="#27272a", padx=14, pady=8)
+        top_bar.pack(fill="x")
+
+        tk.Label(
+            top_bar,
+            text=f"📂 Project: {repo_title}",
+            bg="#27272a",
+            fg="#38bdf8",
+            font=("Segoe UI", 10, "bold"),
+        ).pack(side="left")
+
+        self.explorer_path_lbl = tk.Label(
+            top_bar,
+            text="Select a file to preview",
+            bg="#27272a",
+            fg="#a1a1aa",
+            font=("Segoe UI", 9),
+        )
+        self.explorer_path_lbl.pack(side="right")
+
+        # Split pane: Treeview (left) | Code Preview (right)
+        paned = tk.PanedWindow(modal, orient=tk.HORIZONTAL, bg="#3f3f46", sashwidth=5, bd=0)
+        paned.pack(fill="both", expand=True, padx=10, pady=8)
+
+        tree_frame = tk.Frame(paned, bg="#121214")
+        paned.add(tree_frame, minsize=260)
+
+        tree = ttk.Treeview(tree_frame, show="tree", selectmode="browse", style="Treeview")
+        tree.pack(side="left", fill="both", expand=True)
+
+        tree_sc = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview, style="Dark.Vertical.TScrollbar")
+        tree_sc.pack(side="right", fill="y")
+        tree.config(yscrollcommand=tree_sc.set)
+
+        preview_frame = tk.Frame(paned, bg="#121214")
+        paned.add(preview_frame, minsize=400)
+
+        preview_txt = tk.Text(
+            preview_frame,
+            bg="#121214",
+            fg="#f4f4f5",
+            insertbackground="#121214",
+            relief="flat",
+            wrap="none",
+            font=("Consolas", 10),
+            padx=10,
+            pady=10,
+        )
+        preview_txt.pack(side="left", fill="both", expand=True)
+        make_read_only(preview_txt)
+
+        preview_sc = ttk.Scrollbar(preview_frame, orient="vertical", command=preview_txt.yview, style="Dark.Vertical.TScrollbar")
+        preview_sc.pack(side="right", fill="y")
+        preview_txt.config(yscrollcommand=preview_sc.set)
+
+        # Build folder structure in Treeview
+        tree_nodes = {}
+        ignored_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules", ".idea", ".vscode", "dist", "build"}
+        valid_exts = {".py", ".js", ".ts", ".html", ".css", ".json", ".sql", ".rs", ".go", ".c", ".cpp", ".h", ".java", ".sh", ".md", ".toml", ".yml", ".yaml"}
+
+        for p in sorted(repo_dir.rglob("*")):
+            if any(part in ignored_dirs for part in p.parts):
+                continue
+
+            rel = p.relative_to(repo_dir)
+            parent_id = str(rel.parent) if rel.parent != Path(".") else ""
+
+            if p.is_dir():
+                node_id = str(rel)
+                tree_nodes[node_id] = p
+                tree.insert(parent_id, "end", node_id, text=f"📁 {p.name}", open=False)
+            elif p.is_file() and p.suffix.lower() in valid_exts:
+                node_id = str(rel)
+                tree_nodes[node_id] = p
+                tree.insert(parent_id, "end", node_id, text=f"📄 {p.name}")
+
+        selected_file_content = [""]
+
+        def on_select(event):
+            selected = tree.selection()
+            if not selected:
+                return
+            item_path = tree_nodes.get(selected[0])
+            if item_path and item_path.is_file():
+                try:
+                    content = item_path.read_text(encoding="utf-8", errors="replace")
+                    selected_file_content[0] = content
+                    lines = len(content.splitlines())
+                    self.explorer_path_lbl.config(text=f"{item_path.relative_to(repo_dir)} ({lines} lines)")
+
+                    preview_txt.config(state="normal")
+                    preview_txt.delete("1.0", tk.END)
+                    preview_txt.insert(tk.END, content)
+                    preview_txt.config(state="disabled")
+                except Exception as e:
+                    self.explorer_path_lbl.config(text=f"Error reading file: {e}")
+
+        tree.bind("<<TreeviewSelect>>", on_select)
+
+        # Bottom action bar
+        btn_bar = tk.Frame(modal, bg="#18181b", padx=10, pady=10)
+        btn_bar.pack(fill="x")
+
+        def load_current_file():
+            if selected_file_content[0]:
+                self._load_code_into_active_mode(selected_file_content[0])
+                modal.destroy()
+            else:
+                messagebox.showwarning("Select File", "Please select a file from the tree view first.", parent=modal)
+
+        def bundle_project_core():
+            """Gathers all primary code files in the repo into tagged blocks
+
+            for architectural and dataflow analysis across modules.
+            """
+            code_files = [
+                p for p in sorted(repo_dir.rglob("*.py"))
+                if not any(part in ignored_dirs for part in p.parts)
+            ]
+            if not code_files:
+                code_files = [
+                    p for p in sorted(repo_dir.rglob("*"))
+                    if p.is_file() and p.suffix.lower() in valid_exts and not any(part in ignored_dirs for part in p.parts)
+                ]
+
+            bundle_parts = []
+            for cf in code_files[:8]:  # Limit to 8 core modules to stay within context
+                try:
+                    text = cf.read_text(encoding="utf-8", errors="replace").strip()
+                    if text:
+                        rel = cf.relative_to(repo_dir)
+                        bundle_parts.append(f"# ===== MODULE: {rel} =====\n{text}")
+                except Exception:
+                    pass
+
+            if bundle_parts:
+                composite = "\n\n".join(bundle_parts)
+                self._load_code_into_active_mode(composite)
+                self._set_status(f"Bundled {len(bundle_parts)} modules into workspace.")
+                modal.destroy()
+
+        tk.Button(
+            btn_bar,
+            text="📥 Load Selected File",
+            bg="#2563eb",
+            fg="white",
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=5,
+            command=load_current_file,
+        ).pack(side="left")
+
+        tk.Button(
+            btn_bar,
+            text="📦 Bundle Project Architecture",
+            bg="#10b981",
+            fg="white",
+            relief="flat",
+            font=("Segoe UI", 9, "bold"),
+            padx=12,
+            pady=5,
+            command=bundle_project_core,
+        ).pack(side="left", padx=8)
+
+        tk.Button(
+            btn_bar,
+            text="Close",
+            bg="#27272a",
+            fg="#a1a1aa",
+            relief="flat",
+            font=("Segoe UI", 9),
+            padx=10,
+            pady=5,
+            command=modal.destroy,
+        ).pack(side="right")
+
+    def _load_code_into_active_mode(self, code_text: str):
+        """Helper to inject loaded code into whatever tab is currently active."""
+        self.cached_snippet = code_text
+        self._update_cache_display()
+
+        if self.current_mode == "dissect":
+            self.dissect_code_txt.delete("1.0", tk.END)
+            self.dissect_code_txt.insert(tk.END, code_text)
+        elif self.current_mode == "compress":
+            self.compress_raw_txt.delete("1.0", tk.END)
+            self.compress_raw_txt.insert(tk.END, code_text)
+        elif self.current_mode == "chat":
+            self.chat_code_txt.delete("1.0", tk.END)
+            self.chat_code_txt.insert(tk.END, code_text)
+        elif self.current_mode == "quiz":
+            self.quiz_code_txt.delete("1.0", tk.END)
+            self.quiz_code_txt.insert(tk.END, code_text)
+
+        self._save_session_state()
 
     def _copy_compressed_code(self):
         code = self.compress_code_txt.get("1.0", tk.END).strip()
@@ -2220,7 +2647,7 @@ class LearnerApp(tk.Tk):
                         except Exception:
                             rendered_image = False
 
-                    # Embedded control buttons
+                    # Button: Open in Mermaid Live Editor via redirect bridge
                     btn_open_live = tk.Button(
                         self.output_txt,
                         text="🔍 Open in Mermaid Live Editor",
@@ -2237,6 +2664,7 @@ class LearnerApp(tk.Tk):
                     )
                     self.output_txt.window_create(tk.END, window=btn_open_live)
 
+                    # Button: Open raw vector SVG
                     btn_open_svg = tk.Button(
                         self.output_txt,
                         text="🌐 Open Vector SVG",
@@ -2255,7 +2683,6 @@ class LearnerApp(tk.Tk):
                     self.output_txt.window_create(tk.END, window=btn_open_svg)
                     self.output_txt.insert(tk.END, "\n\n")
 
-                    # Only show raw text fallback if image could not be rendered
                     if not rendered_image:
                         render_markdown(
                             self.output_txt,

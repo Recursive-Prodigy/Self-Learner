@@ -12,7 +12,7 @@ base_dir = (
 )
 env_path = base_dir / ".env"
 if env_path.exists():
-    with open(env_path, "r") as f:
+    with open(env_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if line and not line.startswith("#") and "=" in line:
@@ -27,7 +27,14 @@ PROVIDER_MODELS = {
     "openrouter": "openrouter/free",
 }
 
-LAST_CALL = {"provider": None, "model": None, "chain": []}
+LAST_CALL = {
+    "provider": None,
+    "model": None,
+    "chain": [],
+    "truncated": False,
+    "last_prompt": None,
+    "last_response": "",
+}
 
 
 def get_last_call_info() -> dict:
@@ -67,10 +74,7 @@ def _call_openai_compatible(
 
         choice = data["choices"][0]
         content = choice["message"]["content"].strip()
-        if choice.get("finish_reason") == "length":
-            content += (
-                "\n\n[⚠️ Note: Output was truncated by the model's token limit]"
-            )
+        LAST_CALL["truncated"] = choice.get("finish_reason") == "length"
         return content
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
@@ -123,6 +127,7 @@ def call_claude(prompt) -> str:
     )
     with urllib.request.urlopen(req, timeout=30) as resp:
         data = json.loads(resp.read().decode())
+    LAST_CALL["truncated"] = data.get("stop_reason") == "max_tokens"
     return data["content"][0]["text"].strip()
 
 
@@ -138,7 +143,6 @@ def call_gemini(prompt) -> str:
         "User-Agent": "PersonalLearner/1.0 (Python CLI)",
     }
 
-    # Format multi-turn messages for Gemini REST API
     raw_msgs = _to_messages(prompt)
     contents = []
     for m in raw_msgs:
@@ -156,7 +160,9 @@ def call_gemini(prompt) -> str:
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode())
-        return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        candidate = data["candidates"][0]
+        LAST_CALL["truncated"] = candidate.get("finishReason") == "MAX_TOKENS"
+        return candidate["content"]["parts"][0]["text"].strip()
     except urllib.error.HTTPError as e:
         error_body = e.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Gemini API HTTP {e.code}: {error_body}") from e
@@ -188,13 +194,16 @@ FALLBACK_ORDER = ["groq", "gemini", "openai", "claude", "openrouter"]
 
 def call_llm(prompt, provider: str = None) -> str:
     target = (provider or os.getenv("LLM_PROVIDER", "auto")).lower().strip()
+    LAST_CALL["last_prompt"] = prompt
 
     if target in PROVIDERS:
         model = PROVIDER_MODELS.get(target, "custom")
         LAST_CALL["provider"] = target
         LAST_CALL["model"] = model
         LAST_CALL["chain"] = []
-        return PROVIDERS[target](prompt)
+        res = PROVIDERS[target](prompt)
+        LAST_CALL["last_response"] = res
+        return res
 
     failed_attempts = []
     for candidate in FALLBACK_ORDER:
@@ -204,6 +213,7 @@ def call_llm(prompt, provider: str = None) -> str:
             LAST_CALL["provider"] = candidate
             LAST_CALL["model"] = model
             LAST_CALL["chain"] = failed_attempts
+            LAST_CALL["last_response"] = response
             return response
         except Exception as e:
             failed_attempts.append((candidate, str(e)))
@@ -211,3 +221,26 @@ def call_llm(prompt, provider: str = None) -> str:
 
     error_summary = "\n".join(f"- {p}: {err}" for p, err in failed_attempts)
     raise RuntimeError(f"All LLM providers failed:\n{error_summary}")
+
+
+def call_continue(provider: str = None) -> str:
+    """Continues generating from where the previous response cut off."""
+    target_provider = provider or LAST_CALL.get("provider") or "auto"
+    last_resp = LAST_CALL.get("last_response", "")
+    last_prompt = LAST_CALL.get("last_prompt")
+
+    if isinstance(last_prompt, list):
+        continuation_prompt = list(last_prompt)
+        continuation_prompt.append({"role": "assistant", "content": last_resp})
+        continuation_prompt.append({
+            "role": "user",
+            "content": "Your previous response was cut off by token limit. Continue directly from the exact last character/word without repeating prior text.",
+        })
+    else:
+        continuation_prompt = (
+            f"The following response was cut short by token limit:\n\n"
+            f"--- PARTIAL OUTPUT ---\n{last_resp}\n--- END PARTIAL OUTPUT ---\n\n"
+            "Please continue the response immediately from the exact point where it was cut off. Do not repeat prior content."
+        )
+
+    return call_llm(continuation_prompt, provider=target_provider)
