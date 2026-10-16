@@ -1,7 +1,9 @@
 import base64
+import ctypes
 import datetime
 import io
 import json
+import os
 from pathlib import Path
 import re
 import ssl
@@ -129,10 +131,8 @@ def sanitize_mermaid(raw_code: str) -> str:
     if not has_header:
         lines.insert(0, "flowchart TD")
 
-    # Force all connector links to render bright white
     lines.append("    linkStyle default stroke:#ffffff,stroke-width:2.5px;")
 
-    # Prepend dark theme directive with white line and arrow styling
     init_header = '%%{init: {"theme": "dark", "themeVariables": {"darkMode": true, "lineColor": "#ffffff", "arrowheadColor": "#ffffff", "primaryColor": "#1e293b", "primaryTextColor": "#ffffff", "primaryBorderColor": "#60a5fa"}}}%%'
     return init_header + "\n" + "\n".join(lines)
 
@@ -164,7 +164,6 @@ def enhance_svg_dark_contrast(svg_text: str) -> str:
 
         svg_text = re.sub(r'(<svg[^>]*>)', inject_svg_attrs, svg_text, count=1)
 
-    # Overwrite legacy dark strokes and fills with white
     svg_text = re.sub(r'stroke="#333333"', 'stroke="#ffffff"', svg_text)
     svg_text = re.sub(r'stroke="#333"', 'stroke="#ffffff"', svg_text)
     svg_text = re.sub(r'stroke="black"', 'stroke="#ffffff"', svg_text)
@@ -182,8 +181,8 @@ def encode_mermaid_live_pako(clean_code: str) -> str:
             "themeVariables": {
                 "darkMode": True,
                 "background": "#18181b",
-                "lineColor": "#60a5fa",
-                "arrowheadColor": "#60a5fa",
+                "lineColor": "#ffffff",
+                "arrowheadColor": "#ffffff",
                 "primaryColor": "#1e293b",
                 "primaryTextColor": "#f8fafc",
                 "primaryBorderColor": "#3b82f6"
@@ -208,7 +207,6 @@ def fetch_diagram_data(clean_code: str, workspace_dir: Path) -> tuple[bytes | No
     png_data = None
     svg_text = None
 
-    # Step A: Fetch SVG vector markup
     try:
         req_svg = urllib.request.Request(
             "https://kroki.io/mermaid/svg",
@@ -222,7 +220,6 @@ def fetch_diagram_data(clean_code: str, workspace_dir: Path) -> tuple[bytes | No
     except Exception:
         pass
 
-    # Save SVG with enhanced line contrast
     local_svg_path = workspace_dir / "dataflow_diagram.svg"
     if svg_text:
         svg_text = enhance_svg_dark_contrast(svg_text)
@@ -234,8 +231,6 @@ def fetch_diagram_data(clean_code: str, workspace_dir: Path) -> tuple[bytes | No
         </svg>"""
         local_svg_path.write_text(fallback_svg, encoding="utf-8")
 
-    # Step B: Render / Fetch PNG Bytes for In-App Display
-    # Option 1: QuickChart JSON POST
     if not png_data:
         try:
             payload = json.dumps({
@@ -257,7 +252,6 @@ def fetch_diagram_data(clean_code: str, workspace_dir: Path) -> tuple[bytes | No
         except Exception:
             pass
 
-    # Option 2: Mermaid.ink pako PNG request
     if not png_data:
         try:
             pako_str = encode_mermaid_live_pako(clean_code)
@@ -270,7 +264,6 @@ def fetch_diagram_data(clean_code: str, workspace_dir: Path) -> tuple[bytes | No
         except Exception:
             pass
 
-    # Option 3: Kroki Plain Text POST
     if not png_data:
         try:
             req = urllib.request.Request(
@@ -285,7 +278,6 @@ def fetch_diagram_data(clean_code: str, workspace_dir: Path) -> tuple[bytes | No
         except Exception:
             pass
 
-    # Step C: Save Windows-safe HTML redirect bridge for Live Editor
     pako_str = encode_mermaid_live_pako(clean_code)
     live_target_url = f"https://mermaid.live/edit#pako:{pako_str}"
     local_bridge_path = workspace_dir / "open_live_editor.html"
@@ -314,10 +306,8 @@ def make_read_only(widget: tk.Text):
         selectbackground="#2563eb",
         selectforeground="#ffffff",
     )
-
     widget.tag_configure("sel", background="#2563eb", foreground="#ffffff")
     widget.tag_raise("sel")
-
     widget.bind("<Button-1>", lambda e: e.widget.focus_set(), add="+")
 
     def copy_selection(event=None):
@@ -385,9 +375,7 @@ def render_markdown(widget: tk.Text, markdown_text: str):
 
         if line.strip().startswith("```"):
             if in_code_block:
-                widget.insert(
-                    tk.END, "\n".join(code_lines) + "\n\n", "code_block"
-                )
+                widget.insert(tk.END, "\n".join(code_lines) + "\n\n", "code_block")
                 code_lines = []
                 in_code_block = False
             else:
@@ -403,13 +391,7 @@ def render_markdown(widget: tk.Text, markdown_text: str):
 
         stripped = line.strip()
 
-        if stripped in (
-            "---",
-            "***",
-            "___",
-            "===",
-            "==================================================",
-        ):
+        if stripped in ("---", "***", "___", "===", "=================================================="):
             widget.insert(tk.END, "\n" + "─" * 60 + "\n\n", "divider")
             i += 1
             continue
@@ -459,6 +441,18 @@ class LearnerApp(tk.Tk):
         self.title("Self Learner")
         self.geometry("1200x890")
         self.configure(bg="#18181b")
+
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("selflearner.desktop.app")
+        except Exception:
+            pass
+
+        icon_path = BASE_DIR / "app_icon.ico"
+        if icon_path.exists():
+            try:
+                self.iconbitmap(str(icon_path))
+            except Exception:
+                pass
 
         self._init_workspace_dirs()
 
@@ -510,12 +504,50 @@ class LearnerApp(tk.Tk):
 
     def _init_ttk_styles(self):
         self.style = ttk.Style(self)
-        try:
-            self.style.theme_use("clam")
-        except Exception:
-            pass
+        for theme in ("clam", "alt", "default", "classic"):
+            if theme in self.style.theme_names():
+                try:
+                    self.style.theme_use(theme)
+                    break
+                except Exception:
+                    continue
 
-        # Dark styling for Project Explorer Treeview
+        self.style.configure(
+            "Dark.Vertical.TScrollbar",
+            gripcount=0,
+            background="#27272a",
+            darkcolor="#18181b",
+            lightcolor="#18181b",
+            troughcolor="#18181b",
+            bordercolor="#18181b",
+            arrowcolor="#a1a1aa",
+            relief="flat",
+            arrowsize=11,
+        )
+        self.style.map(
+            "Dark.Vertical.TScrollbar",
+            background=[("active", "#3f3f46"), ("disabled", "#18181b")],
+            arrowcolor=[("active", "#ffffff")],
+        )
+
+        self.style.configure(
+            "Dark.Horizontal.TScrollbar",
+            gripcount=0,
+            background="#27272a",
+            darkcolor="#18181b",
+            lightcolor="#18181b",
+            troughcolor="#18181b",
+            bordercolor="#18181b",
+            arrowcolor="#a1a1aa",
+            relief="flat",
+            arrowsize=11,
+        )
+        self.style.map(
+            "Dark.Horizontal.TScrollbar",
+            background=[("active", "#3f3f46"), ("disabled", "#18181b")],
+            arrowcolor=[("active", "#ffffff")],
+        )
+
         self.style.configure(
             "Treeview",
             background="#121214",
@@ -523,30 +555,12 @@ class LearnerApp(tk.Tk):
             fieldbackground="#121214",
             borderwidth=0,
             font=("Segoe UI", 9),
-            rowheight=22,
+            rowheight=24,
         )
         self.style.map(
             "Treeview",
             background=[("selected", "#2563eb")],
             foreground=[("selected", "#ffffff")],
-        )
-
-        self.style.configure(
-            "Dark.Horizontal.TScrollbar",
-            gripcount=0,
-            background="#333336",
-            darkcolor="#18181b",
-            lightcolor="#18181b",
-            troughcolor="#18181b",
-            bordercolor="#18181b",
-            arrowcolor="#71717a",
-            relief="flat",
-            arrowsize=10,
-        )
-        self.style.map(
-            "Dark.Horizontal.TScrollbar",
-            background=[("active", "#4e4e52"), ("disabled", "#222225")],
-            arrowcolor=[("active", "#ffffff")],
         )
 
         self.style.configure(
@@ -636,7 +650,6 @@ class LearnerApp(tk.Tk):
         )
         self.btn_clear_cache.pack(side="left", padx=2)
 
-        # GitHub Importer Button
         self.btn_gh_import = tk.Button(
             nav_frame,
             text="🌐 Import GitHub",
@@ -649,7 +662,6 @@ class LearnerApp(tk.Tk):
         )
         self.btn_gh_import.pack(side="left", padx=6)
 
-        # API Keys Management Button
         self.btn_api_keys = tk.Button(
             nav_frame,
             text="🔑 API Keys",
@@ -722,15 +734,52 @@ class LearnerApp(tk.Tk):
         )
         self.paned_standard.pack(fill="both", expand=True, padx=8, pady=8)
 
-        # LEFT PANE
+        # LEFT PANE - Independent output windows
         self.left_pane = tk.Frame(self.paned_standard, bg="#18181b")
         self.paned_standard.add(self.left_pane, minsize=320)
 
-        self.left_ctrl_bar = tk.Frame(self.left_pane, bg="#27272a", padx=10, pady=8)
-        self.left_ctrl_bar.pack(fill="x")
+        def create_output_view(parent_frame, banner_text):
+            banner = tk.Frame(parent_frame, bg="#121214", padx=10, pady=4)
+            banner.pack(fill="x", pady=(4, 0))
+            tk.Label(
+                banner,
+                text=banner_text,
+                bg="#121214",
+                fg="#71717a",
+                font=("Consolas", 8, "bold"),
+            ).pack(side="left")
 
-        # Dissector Controls
-        self.dissect_left_bar = tk.Frame(self.left_ctrl_bar, bg="#27272a")
+            box_frame = tk.Frame(parent_frame, bg="#18181b")
+            box_frame.pack(fill="both", expand=True)
+
+            txt = tk.Text(
+                box_frame,
+                bg="#121214",
+                fg="#d4d4d8",
+                insertbackground="#121214",
+                relief="flat",
+                wrap="word",
+                padx=14,
+                pady=14,
+            )
+            txt.pack(side="left", fill="both", expand=True)
+            make_read_only(txt)
+
+            sc = ttk.Scrollbar(
+                box_frame,
+                orient="vertical",
+                command=txt.yview,
+                style="Dark.Vertical.TScrollbar",
+            )
+            sc.pack(side="right", fill="y")
+            txt.config(yscrollcommand=sc.set)
+            return txt
+
+        # 1. Dissector Left View
+        self.dissect_left_frame = tk.Frame(self.left_pane, bg="#18181b")
+        self.dissect_left_frame.pack(fill="both", expand=True)
+
+        self.dissect_left_bar = tk.Frame(self.dissect_left_frame, bg="#27272a", padx=10, pady=8)
         self.dissect_left_bar.pack(fill="x")
 
         tk.Label(
@@ -766,8 +815,16 @@ class LearnerApp(tk.Tk):
         )
         self.btn_run_dissect.pack(side="right")
 
-        # Chat Controls
-        self.chat_left_bar = tk.Frame(self.left_ctrl_bar, bg="#27272a")
+        self.dissect_out_txt = create_output_view(
+            self.dissect_left_frame, "DISSECTOR BREAKDOWN & DIAGRAMS"
+        )
+
+        # 2. Chat Left View
+        self.chat_left_frame = tk.Frame(self.left_pane, bg="#18181b")
+
+        self.chat_left_bar = tk.Frame(self.chat_left_frame, bg="#27272a", padx=10, pady=8)
+        self.chat_left_bar.pack(fill="x")
+
         tk.Label(
             self.chat_left_bar,
             text="💬 Mentor Dialogue",
@@ -797,8 +854,16 @@ class LearnerApp(tk.Tk):
             command=self._start_new_chat,
         ).pack(side="right")
 
-        # Quiz Controls
-        self.quiz_left_bar = tk.Frame(self.left_ctrl_bar, bg="#27272a")
+        self.chat_out_txt = create_output_view(
+            self.chat_left_frame, "MENTOR CONVERSATION FEED"
+        )
+
+        # 3. Quiz Left View
+        self.quiz_left_frame = tk.Frame(self.left_pane, bg="#18181b")
+
+        self.quiz_left_bar = tk.Frame(self.quiz_left_frame, bg="#27272a", padx=10, pady=8)
+        self.quiz_left_bar.pack(fill="x")
+
         tk.Label(
             self.quiz_left_bar,
             text="Difficulty:",
@@ -827,40 +892,9 @@ class LearnerApp(tk.Tk):
         )
         self.btn_quiz_action.pack(side="right")
 
-        out_banner = tk.Frame(self.left_pane, bg="#121214", padx=10, pady=4)
-        out_banner.pack(fill="x", pady=(4, 0))
-        tk.Label(
-            out_banner,
-            text="OUTPUT & RESPONSES [READ-ONLY — SELECTABLE]",
-            bg="#121214",
-            fg="#71717a",
-            font=("Consolas", 8, "bold"),
-        ).pack(side="left")
-
-        out_frame = tk.Frame(self.left_pane, bg="#18181b")
-        out_frame.pack(fill="both", expand=True)
-
-        self.output_txt = tk.Text(
-            out_frame,
-            bg="#121214",
-            fg="#d4d4d8",
-            insertbackground="#121214",
-            relief="flat",
-            wrap="word",
-            padx=14,
-            pady=14,
+        self.quiz_out_txt = create_output_view(
+            self.quiz_left_frame, "ACTIVE QUIZ CHALLENGE & EVALUATION"
         )
-        self.output_txt.pack(side="left", fill="both", expand=True)
-        make_read_only(self.output_txt)
-
-        self.scroll_out_v = ttk.Scrollbar(
-            out_frame,
-            orient="vertical",
-            command=self.output_txt.yview,
-            style="Dark.Vertical.TScrollbar",
-        )
-        self.scroll_out_v.pack(side="right", fill="y")
-        self.output_txt.config(yscrollcommand=self.scroll_out_v.set)
 
         # RIGHT PANE
         self.right_pane = tk.Frame(self.paned_standard, bg="#18181b")
@@ -870,9 +904,7 @@ class LearnerApp(tk.Tk):
         self.dissect_right_frame = tk.Frame(self.right_pane, bg="#18181b")
         self.dissect_right_frame.pack(fill="both", expand=True)
 
-        right_top = tk.Frame(
-            self.dissect_right_frame, bg="#27272a", padx=10, pady=8
-        )
+        right_top = tk.Frame(self.dissect_right_frame, bg="#27272a", padx=10, pady=8)
         right_top.pack(fill="x")
         tk.Label(
             right_top,
@@ -928,9 +960,7 @@ class LearnerApp(tk.Tk):
         # Chat Right View
         self.chat_right_frame = tk.Frame(self.right_pane, bg="#18181b")
 
-        chat_top = tk.Frame(
-            self.chat_right_frame, bg="#27272a", padx=10, pady=6
-        )
+        chat_top = tk.Frame(self.chat_right_frame, bg="#27272a", padx=10, pady=6)
         chat_top.pack(fill="x")
         tk.Label(
             chat_top,
@@ -965,9 +995,7 @@ class LearnerApp(tk.Tk):
         self.chat_code_v_scroll.pack(side="right", fill="y")
         self.chat_code_txt.config(yscrollcommand=self.chat_code_v_scroll.set)
 
-        chat_mid = tk.Frame(
-            self.chat_right_frame, bg="#27272a", padx=10, pady=6
-        )
+        chat_mid = tk.Frame(self.chat_right_frame, bg="#27272a", padx=10, pady=6)
         chat_mid.pack(fill="x")
         tk.Label(
             chat_mid,
@@ -1018,9 +1046,7 @@ class LearnerApp(tk.Tk):
         # Quiz Right View
         self.quiz_right_frame = tk.Frame(self.right_pane, bg="#18181b")
 
-        quiz_top = tk.Frame(
-            self.quiz_right_frame, bg="#27272a", padx=10, pady=6
-        )
+        quiz_top = tk.Frame(self.quiz_right_frame, bg="#27272a", padx=10, pady=6)
         quiz_top.pack(fill="x")
         tk.Label(
             quiz_top,
@@ -1118,9 +1144,7 @@ class LearnerApp(tk.Tk):
         self.comp_left_pane = tk.Frame(self.paned_compress, bg="#18181b")
         self.paned_compress.add(self.comp_left_pane, minsize=240)
 
-        c_left_top = tk.Frame(
-            self.comp_left_pane, bg="#27272a", padx=10, pady=8
-        )
+        c_left_top = tk.Frame(self.comp_left_pane, bg="#27272a", padx=10, pady=8)
         c_left_top.pack(fill="x")
         tk.Label(
             c_left_top,
@@ -1177,9 +1201,7 @@ class LearnerApp(tk.Tk):
         self.comp_mid_pane = tk.Frame(self.paned_compress, bg="#18181b")
         self.paned_compress.add(self.comp_mid_pane, minsize=240)
 
-        c_mid_top = tk.Frame(
-            self.comp_mid_pane, bg="#27272a", padx=10, pady=8
-        )
+        c_mid_top = tk.Frame(self.comp_mid_pane, bg="#27272a", padx=10, pady=8)
         c_mid_top.pack(fill="x")
         tk.Label(
             c_mid_top,
@@ -1212,16 +1234,12 @@ class LearnerApp(tk.Tk):
             style="Dark.Vertical.TScrollbar",
         )
         self.comp_audit_v_scroll.pack(side="right", fill="y")
-        self.compress_audit_txt.config(
-            yscrollcommand=self.comp_audit_v_scroll.set
-        )
+        self.compress_audit_txt.config(yscrollcommand=self.comp_audit_v_scroll.set)
 
         self.comp_right_pane = tk.Frame(self.paned_compress, bg="#18181b")
         self.paned_compress.add(self.comp_right_pane, minsize=240)
 
-        c_right_top = tk.Frame(
-            self.comp_right_pane, bg="#27272a", padx=10, pady=8
-        )
+        c_right_top = tk.Frame(self.comp_right_pane, bg="#27272a", padx=10, pady=8)
         c_right_top.pack(fill="x")
         tk.Label(
             c_right_top,
@@ -1265,9 +1283,7 @@ class LearnerApp(tk.Tk):
             style="Dark.Vertical.TScrollbar",
         )
         self.comp_code_v_scroll.pack(side="right", fill="y")
-        self.compress_code_txt.config(
-            yscrollcommand=self.comp_code_v_scroll.set
-        )
+        self.compress_code_txt.config(yscrollcommand=self.comp_code_v_scroll.set)
 
         self.comp_code_h_scroll = ttk.Scrollbar(
             self.comp_right_pane,
@@ -1279,10 +1295,20 @@ class LearnerApp(tk.Tk):
         self.compress_code_txt.config(xscrollcommand=self.comp_code_h_scroll.set)
 
         self.current_mode = "dissect"
+        self._show_welcome_instructions()
+
+    def _get_active_out_txt(self) -> tk.Text:
+        if self.current_mode == "chat":
+            return self.chat_out_txt
+        elif self.current_mode == "quiz":
+            return self.quiz_out_txt
+        return self.dissect_out_txt
 
     def _init_per_widget_zoom(self):
         self._panel_names = {
-            self.output_txt: "Output Feed",
+            self.dissect_out_txt: "Dissector Output",
+            self.chat_out_txt: "Chat History",
+            self.quiz_out_txt: "Quiz Output",
             self.dissect_code_txt: "Code Editor",
             self.chat_code_txt: "Chat Snippet",
             self.chat_query_txt: "Chat Query Box",
@@ -1300,14 +1326,8 @@ class LearnerApp(tk.Tk):
             w.bind("<Control-plus>", lambda e, wid=w: self._zoom_widget(wid, 1))
             w.bind("<Control-KP_Add>", lambda e, wid=w: self._zoom_widget(wid, 1))
             w.bind("<Control-minus>", lambda e, wid=w: self._zoom_widget(wid, -1))
-            w.bind(
-                "<Control-KP_Subtract>",
-                lambda e, wid=w: self._zoom_widget(wid, -1),
-            )
-            w.bind(
-                "<Control-0>",
-                lambda e, wid=w: self._zoom_widget(wid, 0, reset=True),
-            )
+            w.bind("<Control-KP_Subtract>", lambda e, wid=w: self._zoom_widget(wid, -1))
+            w.bind("<Control-0>", lambda e, wid=w: self._zoom_widget(wid, 0, reset=True))
             w.bind("<Control-MouseWheel>", lambda e, wid=w: self._on_wheel_zoom(e, wid))
 
         self.bind("<Control-equal>", lambda e: self._zoom_focused(1))
@@ -1397,11 +1417,11 @@ class LearnerApp(tk.Tk):
 
         if self.current_mode == "compress":
             return self.compress_audit_txt
-        elif self.current_mode == "dissect":
-            return self.output_txt
         elif self.current_mode == "chat":
-            return self.output_txt
-        return self.output_txt
+            return self.chat_out_txt
+        elif self.current_mode == "quiz":
+            return self.quiz_out_txt
+        return self.dissect_out_txt
 
     def _zoom_focused(self, delta: int, reset: bool = False):
         target = self._get_target_widget()
@@ -1416,9 +1436,7 @@ class LearnerApp(tk.Tk):
         if reset:
             self._zoom_levels[widget] = 10
         else:
-            self._zoom_levels[widget] = max(
-                7, min(26, self._zoom_levels[widget] + delta)
-            )
+            self._zoom_levels[widget] = max(7, min(26, self._zoom_levels[widget] + delta))
 
         self._apply_widget_font(widget)
         name = self._panel_names.get(widget, "Panel")
@@ -1441,7 +1459,7 @@ class LearnerApp(tk.Tk):
         else:
             widget.config(font=("Segoe UI", size))
 
-        if widget in [self.output_txt, self.compress_audit_txt]:
+        if widget in [self.dissect_out_txt, self.chat_out_txt, self.quiz_out_txt, self.compress_audit_txt]:
             self._configure_text_tags(widget, size)
 
     def _configure_text_tags(self, txt: tk.Text, size: int):
@@ -1494,9 +1512,7 @@ class LearnerApp(tk.Tk):
             spacing1=4,
             spacing3=2,
         )
-        txt.tag_configure(
-            "bold", font=("Segoe UI", s, "bold"), foreground="#ffffff"
-        )
+        txt.tag_configure("bold", font=("Segoe UI", s, "bold"), foreground="#ffffff")
         txt.tag_configure(
             "inline_code",
             font=("Consolas", cs),
@@ -1509,13 +1525,8 @@ class LearnerApp(tk.Tk):
             foreground="#4ade80",
             background="#18181b",
         )
-        txt.tag_configure(
-            "divider", font=("Consolas", cs), foreground="#3f3f46"
-        )
-        txt.tag_configure(
-            "quote", font=("Segoe UI", s, "italic"), foreground="#94a3b8"
-        )
-
+        txt.tag_configure("divider", font=("Consolas", cs), foreground="#3f3f46")
+        txt.tag_configure("quote", font=("Segoe UI", s, "italic"), foreground="#94a3b8")
         txt.tag_configure("sel", background="#2563eb", foreground="#ffffff")
         txt.tag_raise("sel")
 
@@ -1523,18 +1534,18 @@ class LearnerApp(tk.Tk):
         welcome_md = """### SELF LEARNER // WORKSPACE READY
 
 **Visual Dataflow Diagrams:**
-• Dissect code and click **`[ 📊 Generate Dataflow Diagram (Mermaid) ]`**.
-• Renders visually in the feed as an embedded diagram, with an option to open the live interactive view in your browser.
+- Dissect code and click **`[ 📊 Generate Dataflow Diagram (Mermaid) ]`**.
+- Renders visually in the feed as an embedded diagram, with an option to open the live interactive view in your browser.
 
 **Navigation & Zoom:**
-• **Cleaner Alternatives Only:** Focuses on idiomatic Python without noise.
-• **VS Code Scrollbars:** Sleek, dark scrollbars line all panels.
-• **Zoom Independently:** Use **Ctrl +** / **Ctrl -** (or **Ctrl + MouseWheel**) on any panel to scale font sizes.
+- **Cleaner Alternatives Only:** Focuses on idiomatic Python without noise.
+- **VS Code Scrollbars:** Sleek, dark scrollbars line all panels.
+- **Zoom Independently:** Use **Ctrl +** / **Ctrl -** (or **Ctrl + MouseWheel**) on any panel to scale font sizes.
 """
-        self.output_txt.config(state="normal")
-        self.output_txt.delete("1.0", tk.END)
-        render_markdown(self.output_txt, welcome_md)
-        self.output_txt.config(state="disabled")
+        self.dissect_out_txt.config(state="normal")
+        self.dissect_out_txt.delete("1.0", tk.END)
+        render_markdown(self.dissect_out_txt, welcome_md)
+        self.dissect_out_txt.config(state="disabled")
 
     def _init_sashes(self):
         self.update_idletasks()
@@ -1553,9 +1564,7 @@ class LearnerApp(tk.Tk):
                 text=f"Snippet: {lines} lines", bg="#065f46", fg="#6ee7b7"
             )
         else:
-            self.cache_chip.config(
-                text="Snippet: None", bg="#3f3f46", fg="#a1a1aa"
-            )
+            self.cache_chip.config(text="Snippet: None", bg="#3f3f46", fg="#a1a1aa")
 
     def _sync_active_snippet_from_ui(self):
         if self.current_mode == "dissect":
@@ -1594,11 +1603,10 @@ class LearnerApp(tk.Tk):
             if was_disabled:
                 w.config(state="disabled")
 
-        self.output_txt.config(state="normal")
-        self.output_txt.insert(
-            tk.END, "Session reset. Cache and chat memory cleared.\n", "quote"
-        )
-        self.output_txt.config(state="disabled")
+        out = self._get_active_out_txt()
+        out.config(state="normal")
+        out.insert(tk.END, "Session reset. Cache and memory cleared.\n", "quote")
+        out.config(state="disabled")
         self._save_session_state()
         self._set_status("Reset complete")
 
@@ -1664,13 +1672,9 @@ class LearnerApp(tk.Tk):
             return
 
         if not self.current_chat_id:
-            self.current_chat_id = datetime.datetime.now().strftime(
-                "%Y%m%d_%H%M%S"
-            )
+            self.current_chat_id = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 
-        chat_file = (
-            self.workspace_dir / "chats" / f"{self.current_chat_id}.json"
-        )
+        chat_file = self.workspace_dir / "chats" / f"{self.current_chat_id}.json"
         title = "Chat Session"
         for msg in self.chat_history:
             if msg["role"] == "user":
@@ -1711,23 +1715,23 @@ class LearnerApp(tk.Tk):
                 self.chat_code_txt.delete("1.0", tk.END)
                 self.chat_code_txt.insert(tk.END, snip)
 
-            self.output_txt.config(state="normal")
-            self.output_txt.delete("1.0", tk.END)
+            self.chat_out_txt.config(state="normal")
+            self.chat_out_txt.delete("1.0", tk.END)
             for msg in self.chat_history:
                 if msg["role"] == "user":
                     clean = msg["content"]
                     if "MY QUESTION:\n" in clean:
                         clean = clean.split("MY QUESTION:\n")[-1]
-                    self.output_txt.insert(
+                    self.chat_out_txt.insert(
                         tk.END, f"\n\nYOU: {clean}\n", "chat_user_badge"
                     )
                 else:
-                    self.output_txt.insert(
+                    self.chat_out_txt.insert(
                         tk.END, "\n" + "─" * 60 + "\n\n", "divider"
                     )
-                    render_markdown(self.output_txt, msg["content"])
-            self.output_txt.config(state="disabled")
-            self.output_txt.see(tk.END)
+                    render_markdown(self.chat_out_txt, msg["content"])
+            self.chat_out_txt.config(state="disabled")
+            self.chat_out_txt.see(tk.END)
             self._set_status(f"Loaded Chat: {record.get('title')}")
         except Exception as e:
             self._handle_error(f"Failed to load chat: {e}")
@@ -1736,23 +1740,19 @@ class LearnerApp(tk.Tk):
         self._save_current_chat()
         self.current_chat_id = None
         self.chat_history = []
-        self.output_txt.config(state="normal")
-        self.output_txt.delete("1.0", tk.END)
-        self.output_txt.insert(
-            tk.END,
-            "Started fresh Mentor Chat. Active snippet retained.\n",
-            "quote",
+        self.chat_out_txt.config(state="normal")
+        self.chat_out_txt.delete("1.0", tk.END)
+        self.chat_out_txt.insert(
+            tk.END, "Started fresh Mentor Chat. Active snippet retained.\n", "quote"
         )
-        self.output_txt.config(state="disabled")
+        self.chat_out_txt.config(state="disabled")
         self._set_status("New chat initialized")
 
     def _open_chat_history_modal(self):
         chats_dir = self.workspace_dir / "chats"
         files = sorted(chats_dir.glob("*.json"), reverse=True)
         if not files:
-            messagebox.showinfo(
-                "Chat History", "No saved conversations found in workspace."
-            )
+            messagebox.showinfo("Chat History", "No saved conversations found in workspace.")
             return
 
         modal = tk.Toplevel(self)
@@ -1761,6 +1761,13 @@ class LearnerApp(tk.Tk):
         modal.configure(bg="#18181b")
         modal.transient(self)
         modal.grab_set()
+
+        icon_path = BASE_DIR / "app_icon.ico"
+        if icon_path.exists():
+            try:
+                modal.iconbitmap(str(icon_path))
+            except Exception:
+                pass
 
         tk.Label(
             modal,
@@ -1850,12 +1857,7 @@ class LearnerApp(tk.Tk):
         ).pack(side="right")
 
     def _open_api_keys_modal(self):
-        """Opens a modal to view, edit, and persist provider API keys to .env and active runtime."""
-        import os
-
         env_file = BASE_DIR / ".env"
-
-        # Read existing .env keys if present
         env_keys = {}
         if env_file.exists():
             try:
@@ -1882,6 +1884,13 @@ class LearnerApp(tk.Tk):
         modal.transient(self)
         modal.grab_set()
 
+        icon_path = BASE_DIR / "app_icon.ico"
+        if icon_path.exists():
+            try:
+                modal.iconbitmap(str(icon_path))
+            except Exception:
+                pass
+
         tk.Label(
             modal,
             text="Provider API Keys",
@@ -1892,7 +1901,7 @@ class LearnerApp(tk.Tk):
 
         tk.Label(
             modal,
-            text="Keys are saved locally in .env and loaded immediately into the active session.",
+            text="Keys are saved locally in .env and loaded immediately into active session memory.",
             bg="#18181b",
             fg="#71717a",
             font=("Segoe UI", 8),
@@ -1925,12 +1934,10 @@ class LearnerApp(tk.Tk):
                 show="*",
                 font=("Consolas", 9),
             )
-            # Preload from runtime environment or .env file
             current_val = os.environ.get(env_var) or env_keys.get(env_var, "")
             entry.insert(0, current_val)
             entry.pack(side="left", fill="x", expand=True, ipady=4, padx=(4, 6))
 
-            # Quick show/hide toggle button
             def toggle_show(e=entry):
                 e.config(show="" if e.cget("show") == "*" else "*")
 
@@ -1950,7 +1957,6 @@ class LearnerApp(tk.Tk):
         btn_bar.pack(fill="x")
 
         def save_keys():
-            # Update running environment immediately
             for env_var, entry_widget in entries.items():
                 val = entry_widget.get().strip()
                 if val:
@@ -1960,7 +1966,6 @@ class LearnerApp(tk.Tk):
                     del os.environ[env_var]
                     env_keys.pop(env_var, None)
 
-            # Persist to local .env
             lines = [f"{k}={v}" for k, v in env_keys.items()]
             try:
                 env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -2005,10 +2010,6 @@ class LearnerApp(tk.Tk):
             self._set_status(f"Workspace set: {self.workspace_dir.name}")
 
     def _import_from_github(self):
-        """Imports either a single file OR an entire repository into workspace_data/repos/
-
-        and launches the interactive Project Explorer.
-        """
         url = simpledialog.askstring(
             "Import from GitHub",
             "Paste GitHub Repository or File URL:\n\n"
@@ -2019,16 +2020,21 @@ class LearnerApp(tk.Tk):
         if not url:
             return
 
-        url = url.strip()
+        # Sanitize pasted input: strip brackets, quotes, and extract clean URL
+        url_match = re.search(r"https?://[^\s)\]>\"']+", url.strip())
+        if not url_match:
+            self._display_error("Invalid URL. Please paste a valid https://github.com URL.")
+            return
 
-        # Check if the URL points to a specific single file
+        clean_url = url_match.group(0)
+
         code_exts = (".py", ".js", ".ts", ".html", ".css", ".json", ".sql", ".rs", ".go", ".c", ".cpp", ".java", ".sh")
-        is_single_file = "/blob/" in url or "/raw/" in url or any(url.endswith(ext) for ext in code_exts)
+        is_single_file = "/blob/" in clean_url or "/raw/" in clean_url or any(clean_url.endswith(ext) for ext in code_exts)
 
         if is_single_file:
-            self._import_single_github_file(url)
+            self._import_single_github_file(clean_url)
         else:
-            self._import_github_repository(url)
+            self._import_github_repository(clean_url)
 
     def _import_single_github_file(self, url: str):
         raw_url = url
@@ -2041,7 +2047,11 @@ class LearnerApp(tk.Tk):
 
         def worker():
             try:
-                req = urllib.request.Request(raw_url, headers={"User-Agent": "SelfLearner/1.0"})
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Accept": "*/*",
+                }
+                req = urllib.request.Request(raw_url, headers=headers)
                 with urllib.request.urlopen(req, timeout=15, context=get_ssl_context()) as resp:
                     code_text = resp.read().decode("utf-8", errors="replace")
 
@@ -2056,44 +2066,68 @@ class LearnerApp(tk.Tk):
         threading.Thread(target=worker, daemon=True).start()
 
     def _import_github_repository(self, url: str):
+        # Extract owner and repo cleanly, stripping any stray punctuation
         match = re.search(r"github\.com/([^/]+)/([^/]+)", url)
         if not match:
             self._display_error("Invalid GitHub URL format. Use https://github.com/owner/repo")
             return
 
-        owner = match.group(1)
-        repo = match.group(2).replace(".git", "")
+        owner = re.sub(r"[^a-zA-Z0-9_.-]", "", match.group(1).strip())
+        raw_repo = match.group(2).split("/")[0].replace(".git", "").strip()
+        repo = re.sub(r"[^a-zA-Z0-9_.-]", "", raw_repo)
+
+        if not owner or not repo:
+            self._display_error("Could not parse repository owner or name.")
+            return
+
         repo_name = f"{owner}_{repo}"
         repo_dir = self.workspace_dir / "repos" / repo_name
+
+        branch_match = re.search(r"/tree/([^/]+)", url)
+        custom_branch = re.sub(r"[^a-zA-Z0-9_.-]", "", branch_match.group(1).strip()) if branch_match else None
 
         self._set_status(f"Downloading {owner}/{repo} repository archive...")
 
         def worker():
             try:
-                # Download full repository zipball (auto-resolves default branch)
-                zip_urls = [
+                zip_urls = []
+                if custom_branch:
+                    zip_urls.extend([
+                        f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/{custom_branch}",
+                        f"https://github.com/{owner}/{repo}/archive/refs/heads/{custom_branch}.zip",
+                    ])
+
+                zip_urls.extend([
+                    f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/main",
+                    f"https://codeload.github.com/{owner}/{repo}/zip/refs/heads/master",
+                    f"https://github.com/{owner}/{repo}/archive/refs/heads/main.zip",
+                    f"https://github.com/{owner}/{repo}/archive/refs/heads/master.zip",
                     f"https://api.github.com/repos/{owner}/{repo}/zipball",
-                    f"https://github.com/{owner}/{repo}/archive/HEAD.zip",
-                ]
+                ])
 
                 zip_data = None
-                headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) SelfLearner/1.0"}
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Accept": "*/*",
+                }
                 ssl_ctx = get_ssl_context()
+                last_err = None
 
                 for z_url in zip_urls:
                     try:
                         req = urllib.request.Request(z_url, headers=headers)
-                        with urllib.request.urlopen(req, timeout=30, context=ssl_ctx) as resp:
-                            zip_data = resp.read()
-                            if zip_data.startswith(b"PK"):
+                        with urllib.request.urlopen(req, timeout=25, context=ssl_ctx) as resp:
+                            data = resp.read()
+                            if data.startswith(b"PK"):
+                                zip_data = data
                                 break
-                    except Exception:
+                    except Exception as err:
+                        last_err = err
                         continue
 
                 if not zip_data or not zip_data.startswith(b"PK"):
-                    raise RuntimeError("Could not download valid repository archive. Verify repo is public.")
+                    raise RuntimeError(f"Could not download repository archive (Last error: {last_err}). Verify the repository is public.")
 
-                # Extract and strip GitHub's root hash directory
                 repo_dir.mkdir(parents=True, exist_ok=True)
                 with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
                     namelist = z.namelist()
@@ -2116,20 +2150,24 @@ class LearnerApp(tk.Tk):
                 self.after(0, lambda: self._set_status(f"Project loaded: {owner}/{repo}"))
             except Exception as e:
                 self.after(0, lambda: self._handle_error(f"Repository Clone Failed:\n{e}"))
+                self.after(0, lambda: messagebox.showerror("GitHub Import Failed", str(e), parent=self))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _open_repo_explorer_modal(self, repo_dir: Path, repo_title: str):
-        """Displays an interactive Project File Tree with syntax preview,
-
-        single-file loading, and multi-file cross-module bundling.
-        """
         modal = tk.Toplevel(self)
         modal.title(f"Project Explorer — {repo_title}")
         modal.geometry("960x640")
         modal.configure(bg="#18181b")
         modal.transient(self)
         modal.grab_set()
+
+        icon_path = BASE_DIR / "app_icon.ico"
+        if icon_path.exists():
+            try:
+                modal.iconbitmap(str(icon_path))
+            except Exception:
+                pass
 
         top_bar = tk.Frame(modal, bg="#27272a", padx=14, pady=8)
         top_bar.pack(fill="x")
@@ -2151,7 +2189,6 @@ class LearnerApp(tk.Tk):
         )
         self.explorer_path_lbl.pack(side="right")
 
-        # Split pane: Treeview (left) | Code Preview (right)
         paned = tk.PanedWindow(modal, orient=tk.HORIZONTAL, bg="#3f3f46", sashwidth=5, bd=0)
         paned.pack(fill="both", expand=True, padx=10, pady=8)
 
@@ -2186,24 +2223,22 @@ class LearnerApp(tk.Tk):
         preview_sc.pack(side="right", fill="y")
         preview_txt.config(yscrollcommand=preview_sc.set)
 
-        # Build folder structure in Treeview
         tree_nodes = {}
         ignored_dirs = {".git", "__pycache__", ".venv", "venv", "node_modules", ".idea", ".vscode", "dist", "build"}
         valid_exts = {".py", ".js", ".ts", ".html", ".css", ".json", ".sql", ".rs", ".go", ".c", ".cpp", ".h", ".java", ".sh", ".md", ".toml", ".yml", ".yaml"}
 
         for p in sorted(repo_dir.rglob("*")):
-            if any(part in ignored_dirs for part in p.parts):
+            rel = p.relative_to(repo_dir)
+            if any(part in ignored_dirs for part in rel.parts):
                 continue
 
-            rel = p.relative_to(repo_dir)
-            parent_id = str(rel.parent) if rel.parent != Path(".") else ""
+            node_id = str(rel).replace("\\", "/")
+            parent_id = str(rel.parent).replace("\\", "/") if rel.parent != Path(".") else ""
 
             if p.is_dir():
-                node_id = str(rel)
                 tree_nodes[node_id] = p
-                tree.insert(parent_id, "end", node_id, text=f"📁 {p.name}", open=False)
+                tree.insert(parent_id, "end", node_id, text=f"📁 {p.name}", open=True)
             elif p.is_file() and p.suffix.lower() in valid_exts:
-                node_id = str(rel)
                 tree_nodes[node_id] = p
                 tree.insert(parent_id, "end", node_id, text=f"📄 {p.name}")
 
@@ -2230,7 +2265,6 @@ class LearnerApp(tk.Tk):
 
         tree.bind("<<TreeviewSelect>>", on_select)
 
-        # Bottom action bar
         btn_bar = tk.Frame(modal, bg="#18181b", padx=10, pady=10)
         btn_bar.pack(fill="x")
 
@@ -2242,22 +2276,18 @@ class LearnerApp(tk.Tk):
                 messagebox.showwarning("Select File", "Please select a file from the tree view first.", parent=modal)
 
         def bundle_project_core():
-            """Gathers all primary code files in the repo into tagged blocks
-
-            for architectural and dataflow analysis across modules.
-            """
             code_files = [
                 p for p in sorted(repo_dir.rglob("*.py"))
-                if not any(part in ignored_dirs for part in p.parts)
+                if not any(part in ignored_dirs for part in p.relative_to(repo_dir).parts)
             ]
             if not code_files:
                 code_files = [
                     p for p in sorted(repo_dir.rglob("*"))
-                    if p.is_file() and p.suffix.lower() in valid_exts and not any(part in ignored_dirs for part in p.parts)
+                    if p.is_file() and p.suffix.lower() in valid_exts and not any(part in ignored_dirs for part in p.relative_to(repo_dir).parts)
                 ]
 
             bundle_parts = []
-            for cf in code_files[:8]:  # Limit to 8 core modules to stay within context
+            for cf in code_files[:8]:
                 try:
                     text = cf.read_text(encoding="utf-8", errors="replace").strip()
                     if text:
@@ -2309,7 +2339,6 @@ class LearnerApp(tk.Tk):
         ).pack(side="right")
 
     def _load_code_into_active_mode(self, code_text: str):
-        """Helper to inject loaded code into whatever tab is currently active."""
         self.cached_snippet = code_text
         self._update_cache_display()
 
@@ -2348,18 +2377,15 @@ class LearnerApp(tk.Tk):
         self.paned_compress.pack_forget()
         self.paned_standard.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.chat_left_bar.pack_forget()
-        self.quiz_left_bar.pack_forget()
-        self.dissect_left_bar.pack(fill="x")
+        self.chat_left_frame.pack_forget()
+        self.quiz_left_frame.pack_forget()
+        self.dissect_left_frame.pack(fill="both", expand=True)
 
         self.chat_right_frame.pack_forget()
         self.quiz_right_frame.pack_forget()
         self.dissect_right_frame.pack(fill="both", expand=True)
 
-        if (
-            self.cached_snippet
-            and not self.dissect_code_txt.get("1.0", tk.END).strip()
-        ):
+        if self.cached_snippet and not self.dissect_code_txt.get("1.0", tk.END).strip():
             self.dissect_code_txt.insert(tk.END, self.cached_snippet)
         self._save_session_state()
 
@@ -2372,10 +2398,7 @@ class LearnerApp(tk.Tk):
         self.paned_standard.pack_forget()
         self.paned_compress.pack(fill="both", expand=True, padx=8, pady=8)
 
-        if (
-            self.cached_snippet
-            and not self.compress_raw_txt.get("1.0", tk.END).strip()
-        ):
+        if self.cached_snippet and not self.compress_raw_txt.get("1.0", tk.END).strip():
             self.compress_raw_txt.insert(tk.END, self.cached_snippet)
         self._save_session_state()
 
@@ -2388,18 +2411,15 @@ class LearnerApp(tk.Tk):
         self.paned_compress.pack_forget()
         self.paned_standard.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.dissect_left_bar.pack_forget()
-        self.quiz_left_bar.pack_forget()
-        self.chat_left_bar.pack(fill="x")
+        self.dissect_left_frame.pack_forget()
+        self.quiz_left_frame.pack_forget()
+        self.chat_left_frame.pack(fill="both", expand=True)
 
         self.dissect_right_frame.pack_forget()
         self.quiz_right_frame.pack_forget()
         self.chat_right_frame.pack(fill="both", expand=True)
 
-        if (
-            self.cached_snippet
-            and not self.chat_code_txt.get("1.0", tk.END).strip()
-        ):
+        if self.cached_snippet and not self.chat_code_txt.get("1.0", tk.END).strip():
             self.chat_code_txt.insert(tk.END, self.cached_snippet)
         self._save_session_state()
 
@@ -2412,18 +2432,15 @@ class LearnerApp(tk.Tk):
         self.paned_compress.pack_forget()
         self.paned_standard.pack(fill="both", expand=True, padx=8, pady=8)
 
-        self.dissect_left_bar.pack_forget()
-        self.chat_left_bar.pack_forget()
-        self.quiz_left_bar.pack(fill="x")
+        self.dissect_left_frame.pack_forget()
+        self.chat_left_frame.pack_forget()
+        self.quiz_left_frame.pack(fill="both", expand=True)
 
         self.dissect_right_frame.pack_forget()
         self.chat_right_frame.pack_forget()
         self.quiz_right_frame.pack(fill="both", expand=True)
 
-        if (
-            self.cached_snippet
-            and not self.quiz_code_txt.get("1.0", tk.END).strip()
-        ):
+        if self.cached_snippet and not self.quiz_code_txt.get("1.0", tk.END).strip():
             self.quiz_code_txt.insert(tk.END, self.cached_snippet)
         self._save_session_state()
 
@@ -2444,35 +2461,36 @@ class LearnerApp(tk.Tk):
         self.status_lbl.config(text=text)
 
     def _display_formatted_response(
-        self, raw_markdown: str, meta: dict, append: bool = False
+        self, raw_markdown: str, meta: dict, append: bool = False, target_txt: tk.Text = None
     ):
-        self.output_txt.config(state="normal")
+        out = target_txt or self._get_active_out_txt()
+        out.config(state="normal")
         if not append:
-            self.output_txt.delete("1.0", tk.END)
+            out.delete("1.0", tk.END)
         else:
-            self.output_txt.insert(tk.END, "\n" + "─" * 60 + "\n\n", "divider")
+            out.insert(tk.END, "\n" + "─" * 60 + "\n\n", "divider")
 
         provider = meta.get("provider") or "unknown"
         model = meta.get("model") or "custom"
         chain = meta.get("chain", [])
 
         badge_text = f" MODEL SELECTED: {provider.upper()} // {model} "
-        self.output_txt.insert(tk.END, badge_text, "meta_badge")
-        self.output_txt.insert(tk.END, "\n")
+        out.insert(tk.END, badge_text, "meta_badge")
+        out.insert(tk.END, "\n")
 
         if chain:
             for p, err in chain:
-                self.output_txt.insert(
+                out.insert(
                     tk.END, f"  ↳ fallback: {p} unavailable ({err})\n", "meta_trail"
                 )
 
-        self.output_txt.insert(tk.END, "─" * 60 + "\n", "divider")
-        render_markdown(self.output_txt, raw_markdown)
+        out.insert(tk.END, "─" * 60 + "\n", "divider")
+        render_markdown(out, raw_markdown)
 
-        if self.current_mode == "dissect":
-            self.output_txt.insert(tk.END, "\n\n")
+        if self.current_mode == "dissect" and out == self.dissect_out_txt:
+            out.insert(tk.END, "\n\n")
             btn_diag = tk.Button(
-                self.output_txt,
+                out,
                 text="📊 Generate Dataflow Diagram (Mermaid)",
                 bg="#1e293b",
                 fg="#38bdf8",
@@ -2484,14 +2502,12 @@ class LearnerApp(tk.Tk):
                 pady=5,
                 cursor="hand2",
             )
-            btn_diag.config(
-                command=lambda b=btn_diag: self._trigger_generate_diagram(b)
-            )
-            self.output_txt.window_create(tk.END, window=btn_diag)
-            self.output_txt.insert(tk.END, "\n\n")
+            btn_diag.config(command=lambda b=btn_diag: self._trigger_generate_diagram(b))
+            out.window_create(tk.END, window=btn_diag)
+            out.insert(tk.END, "\n\n")
 
         if meta.get("truncated"):
-            self.output_txt.insert(
+            out.insert(
                 tk.END,
                 "\n\n[⚠️ Note: Output was truncated by the model's token limit. Click 'Continue Output' above to proceed.]\n",
                 "meta_trail",
@@ -2500,8 +2516,8 @@ class LearnerApp(tk.Tk):
         else:
             self.btn_continue.pack_forget()
 
-        self.output_txt.config(state="disabled")
-        self.output_txt.see(tk.END)
+        out.config(state="disabled")
+        out.see(tk.END)
         self._set_status(f"Resolved: {provider} ({model})")
 
     def _on_action_click(self):
@@ -2544,17 +2560,15 @@ class LearnerApp(tk.Tk):
     def _trigger_dissect(self, code: str):
         mode_idx = self.focus_mode_combo.current()
         mode_keys = ["all", "mechanics", "fixes", "gotchas"]
-        selected_mode = (
-            mode_keys[mode_idx] if 0 <= mode_idx < len(mode_keys) else "all"
-        )
+        selected_mode = mode_keys[mode_idx] if 0 <= mode_idx < len(mode_keys) else "all"
         provider = self._get_selected_provider()
 
         self.btn_run_dissect.config(state="disabled")
         self._set_status(f"Dissecting via {provider}...")
-        self.output_txt.config(state="normal")
-        self.output_txt.delete("1.0", tk.END)
-        self.output_txt.insert(tk.END, "Analyzing code mechanics...\n", "quote")
-        self.output_txt.config(state="disabled")
+        self.dissect_out_txt.config(state="normal")
+        self.dissect_out_txt.delete("1.0", tk.END)
+        self.dissect_out_txt.insert(tk.END, "Analyzing code mechanics...\n", "quote")
+        self.dissect_out_txt.config(state="disabled")
 
         def worker():
             try:
@@ -2563,15 +2577,13 @@ class LearnerApp(tk.Tk):
                 self.after(
                     0,
                     lambda: self._display_formatted_response(
-                        res, meta, append=False
+                        res, meta, append=False, target_txt=self.dissect_out_txt
                     ),
                 )
             except Exception as e:
                 self.after(0, lambda: self._handle_error(str(e)))
             finally:
-                self.after(
-                    0, lambda: self.btn_run_dissect.config(state="normal")
-                )
+                self.after(0, lambda: self.btn_run_dissect.config(state="normal"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2616,8 +2628,8 @@ class LearnerApp(tk.Tk):
                 )
 
                 def ui_render():
-                    self.output_txt.config(state="normal")
-                    self.output_txt.insert(
+                    self.dissect_out_txt.config(state="normal")
+                    self.dissect_out_txt.insert(
                         tk.END, "\n### ARCHITECTURAL DATAFLOW\n\n", "h3"
                     )
 
@@ -2631,7 +2643,7 @@ class LearnerApp(tk.Tk):
                                     bg_img.paste(img, (0, 0), img.convert("RGBA"))
                                     img = bg_img.convert("RGB")
 
-                                max_w = min(560, max(300, self.output_txt.winfo_width() - 40))
+                                max_w = min(560, max(300, self.dissect_out_txt.winfo_width() - 40))
                                 if img.width > max_w:
                                     ratio = max_w / float(img.width)
                                     new_h = int(float(img.height) * ratio)
@@ -2641,15 +2653,14 @@ class LearnerApp(tk.Tk):
                                 photo = tk.PhotoImage(data=base64.b64encode(png_bytes))
 
                             self._image_refs.append(photo)
-                            self.output_txt.image_create(tk.END, image=photo)
-                            self.output_txt.insert(tk.END, "\n\n")
+                            self.dissect_out_txt.image_create(tk.END, image=photo)
+                            self.dissect_out_txt.insert(tk.END, "\n\n")
                             rendered_image = True
                         except Exception:
                             rendered_image = False
 
-                    # Button: Open in Mermaid Live Editor via redirect bridge
                     btn_open_live = tk.Button(
-                        self.output_txt,
+                        self.dissect_out_txt,
                         text="🔍 Open in Mermaid Live Editor",
                         bg="#0f172a",
                         fg="#38bdf8",
@@ -2662,11 +2673,10 @@ class LearnerApp(tk.Tk):
                         cursor="hand2",
                         command=lambda f=local_bridge_file: webbrowser.open(f.as_uri()),
                     )
-                    self.output_txt.window_create(tk.END, window=btn_open_live)
+                    self.dissect_out_txt.window_create(tk.END, window=btn_open_live)
 
-                    # Button: Open raw vector SVG
                     btn_open_svg = tk.Button(
-                        self.output_txt,
+                        self.dissect_out_txt,
                         text="🌐 Open Vector SVG",
                         bg="#18181b",
                         fg="#a1a1aa",
@@ -2679,13 +2689,13 @@ class LearnerApp(tk.Tk):
                         cursor="hand2",
                         command=lambda f=local_svg_file: webbrowser.open(f.as_uri()),
                     )
-                    self.output_txt.insert(tk.END, "  ")
-                    self.output_txt.window_create(tk.END, window=btn_open_svg)
-                    self.output_txt.insert(tk.END, "\n\n")
+                    self.dissect_out_txt.insert(tk.END, "  ")
+                    self.dissect_out_txt.window_create(tk.END, window=btn_open_svg)
+                    self.dissect_out_txt.insert(tk.END, "\n\n")
 
                     if not rendered_image:
                         render_markdown(
-                            self.output_txt,
+                            self.dissect_out_txt,
                             f"```mermaid\n{clean_mermaid}\n```\n",
                         )
 
@@ -2693,7 +2703,7 @@ class LearnerApp(tk.Tk):
                         caption_parts = diagram_res.split("```")
                         if len(caption_parts) >= 3 and caption_parts[2].strip():
                             render_markdown(
-                                self.output_txt,
+                                self.dissect_out_txt,
                                 f"> {caption_parts[2].strip()}\n\n",
                             )
 
@@ -2704,8 +2714,8 @@ class LearnerApp(tk.Tk):
                         state="disabled",
                     )
 
-                    self.output_txt.config(state="disabled")
-                    self.output_txt.see(tk.END)
+                    self.dissect_out_txt.config(state="disabled")
+                    self.dissect_out_txt.see(tk.END)
                     self._set_status(f"Dataflow generated via {provider}")
 
                 self.after(0, ui_render)
@@ -2718,14 +2728,14 @@ class LearnerApp(tk.Tk):
                         fg="#ffffff",
                     )
                     self._set_status(f"Diagram error: {err_msg}")
-                    self.output_txt.config(state="normal")
-                    self.output_txt.insert(
+                    self.dissect_out_txt.config(state="normal")
+                    self.dissect_out_txt.insert(
                         tk.END,
                         f"\n[⚠️ Diagram error: {err_msg}]\n",
                         "meta_trail",
                     )
-                    self.output_txt.config(state="disabled")
-                    self.output_txt.see(tk.END)
+                    self.dissect_out_txt.config(state="disabled")
+                    self.dissect_out_txt.see(tk.END)
 
                 self.after(0, ui_fail)
 
@@ -2738,9 +2748,7 @@ class LearnerApp(tk.Tk):
 
         self.compress_audit_txt.config(state="normal")
         self.compress_audit_txt.delete("1.0", tk.END)
-        self.compress_audit_txt.insert(
-            tk.END, "Auditing transformations...\n", "quote"
-        )
+        self.compress_audit_txt.insert(tk.END, "Auditing transformations...\n", "quote")
         self.compress_audit_txt.config(state="disabled")
 
         self.compress_code_txt.config(state="normal")
@@ -2777,9 +2785,7 @@ class LearnerApp(tk.Tk):
             except Exception as e:
                 self.after(0, lambda: self._handle_error(str(e)))
             finally:
-                self.after(
-                    0, lambda: self.btn_run_compress.config(state="normal")
-                )
+                self.after(0, lambda: self.btn_run_compress.config(state="normal"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2796,18 +2802,17 @@ class LearnerApp(tk.Tk):
                 def ui():
                     if self.current_mode == "compress":
                         self.compress_audit_txt.config(state="normal")
-                        self.compress_audit_txt.insert(
-                            tk.END, "\n" + continued_chunk
-                        )
+                        self.compress_audit_txt.insert(tk.END, "\n" + continued_chunk)
                         if not meta.get("truncated"):
                             self.btn_continue.pack_forget()
                         self.compress_audit_txt.config(state="disabled")
                     else:
-                        self.output_txt.config(state="normal")
-                        self.output_txt.insert(tk.END, "\n" + continued_chunk)
+                        out = self._get_active_out_txt()
+                        out.config(state="normal")
+                        out.insert(tk.END, "\n" + continued_chunk)
                         if not meta.get("truncated"):
                             self.btn_continue.pack_forget()
-                        self.output_txt.config(state="disabled")
+                        out.config(state="disabled")
 
                     self._set_status("Continued response appended.")
 
@@ -2829,9 +2834,7 @@ class LearnerApp(tk.Tk):
 
         active_code = self.cached_snippet
         if not active_code and not query:
-            self._display_error(
-                "Provide code or enter a question to start chatting."
-            )
+            self._display_error("Provide code or enter a question to start chatting.")
             return
 
         provider = self._get_selected_provider()
@@ -2844,9 +2847,7 @@ class LearnerApp(tk.Tk):
                 f"--- CODE SNIPPET ---\n{active_code}\n--- END CODE ---\n\n"
                 f"MY QUESTION:\n{query or 'Walk me through what this code is doing and why.'}"
             )
-            display_user_query = (
-                query or "Walk me through what this code is doing and why."
-            )
+            display_user_query = query or "Walk me through what this code is doing and why."
         else:
             if code and code != self.cached_snippet:
                 user_msg = f"[Updated Code Snippet]:\n```python\n{code}\n```\n\n{query}"
@@ -2856,13 +2857,13 @@ class LearnerApp(tk.Tk):
 
         self.chat_history.append({"role": "user", "content": user_msg})
 
-        self.output_txt.config(state="normal")
-        self.output_txt.insert(
+        self.chat_out_txt.config(state="normal")
+        self.chat_out_txt.insert(
             tk.END, f"\n\nYOU: {display_user_query}\n", "chat_user_badge"
         )
-        self.output_txt.insert(tk.END, "Thinking...\n", "quote")
-        self.output_txt.config(state="disabled")
-        self.output_txt.see(tk.END)
+        self.chat_out_txt.insert(tk.END, "Thinking...\n", "quote")
+        self.chat_out_txt.config(state="disabled")
+        self.chat_out_txt.see(tk.END)
 
         self.chat_query_txt.delete("1.0", tk.END)
         self.btn_chat_send.config(state="disabled")
@@ -2871,20 +2872,18 @@ class LearnerApp(tk.Tk):
         def worker():
             try:
                 response = call_llm(self.chat_history, provider=provider)
-                self.chat_history.append(
-                    {"role": "assistant", "content": response}
-                )
+                self.chat_history.append({"role": "assistant", "content": response})
                 self._save_current_chat()
                 meta = get_last_call_info()
 
                 def ui_update():
-                    self.output_txt.config(state="normal")
-                    idx = self.output_txt.search("Thinking...\n", "1.0", tk.END)
+                    self.chat_out_txt.config(state="normal")
+                    idx = self.chat_out_txt.search("Thinking...\n", "1.0", tk.END)
                     if idx:
-                        self.output_txt.delete(idx, f"{idx}+12c")
-                    self.output_txt.config(state="disabled")
+                        self.chat_out_txt.delete(idx, f"{idx}+12c")
+                    self.chat_out_txt.config(state="disabled")
                     self._display_formatted_response(
-                        response, meta, append=True
+                        response, meta, append=True, target_txt=self.chat_out_txt
                     )
 
                 self.after(0, ui_update)
@@ -2913,20 +2912,18 @@ class LearnerApp(tk.Tk):
         self.btn_quiz_action.config(state="disabled")
         self._set_status(f"Generating Level {level} challenge...")
 
-        self.output_txt.config(state="normal")
-        self.output_txt.delete("1.0", tk.END)
-        self.output_txt.insert(
+        self.quiz_out_txt.config(state="normal")
+        self.quiz_out_txt.delete("1.0", tk.END)
+        self.quiz_out_txt.insert(
             tk.END,
             f"Designing grounded Level {level} challenge from snippet...\n",
             "quote",
         )
-        self.output_txt.config(state="disabled")
+        self.quiz_out_txt.config(state="disabled")
 
         def worker():
             try:
-                data = generate_question_from_snippet(
-                    snippet, level=level, provider=provider
-                )
+                data = generate_question_from_snippet(snippet, level=level, provider=provider)
                 self.active_concept_name = data["concept_name"]
                 self.active_question = data["question"]
                 meta = get_last_call_info()
@@ -2938,22 +2935,18 @@ class LearnerApp(tk.Tk):
                 )
 
                 def ui_update():
-                    self._display_formatted_response(preview, meta, append=False)
+                    self._display_formatted_response(
+                        preview, meta, append=False, target_txt=self.quiz_out_txt
+                    )
                     self.awaiting_quiz_answer = True
-                    self.quiz_mid_lbl.config(
-                        text="TYPE YOUR ANSWER BELOW (INPUT):"
-                    )
-                    self.btn_quiz_action.config(
-                        text="Submit", bg="#10b981", state="normal"
-                    )
+                    self.quiz_mid_lbl.config(text="TYPE YOUR ANSWER BELOW (INPUT):")
+                    self.btn_quiz_action.config(text="Submit", bg="#10b981", state="normal")
                     self.quiz_answer_txt.delete("1.0", tk.END)
 
                 self.after(0, ui_update)
             except Exception as e:
                 self.after(0, lambda: self._handle_error(str(e)))
-                self.after(
-                    0, lambda: self.btn_quiz_action.config(state="normal")
-                )
+                self.after(0, lambda: self.btn_quiz_action.config(state="normal"))
 
         threading.Thread(target=worker, daemon=True).start()
 
@@ -2988,49 +2981,43 @@ class LearnerApp(tk.Tk):
                 )
 
                 if verdict == "PASS":
-                    save_concept_level(
-                        self.active_concept_name, self.active_level
-                    )
+                    save_concept_level(self.active_concept_name, self.active_level)
                     output += (
                         f"\n---\n**Mastery Logged**: `{self.active_concept_name}` "
                         f"verified at Level {self.active_level}/6 in `concepts.json`!\n"
                     )
 
                 def ui_update():
-                    self._display_formatted_response(output, meta, append=False)
+                    self._display_formatted_response(
+                        output, meta, append=False, target_txt=self.quiz_out_txt
+                    )
                     self.awaiting_quiz_answer = False
-                    self.quiz_mid_lbl.config(
-                        text="YOUR ANSWER (Submit after generating challenge):"
-                    )
-                    self.btn_quiz_action.config(
-                        text="Generate", bg="#10b981", state="normal"
-                    )
+                    self.quiz_mid_lbl.config(text="YOUR ANSWER (Submit after generating challenge):")
+                    self.btn_quiz_action.config(text="Generate", bg="#10b981", state="normal")
                     self.btn_quiz_submit.config(state="normal")
                     self.quiz_answer_txt.delete("1.0", tk.END)
 
                 self.after(0, ui_update)
             except Exception as e:
                 self.after(0, lambda: self._handle_error(str(e)))
-                self.after(
-                    0, lambda: self.btn_quiz_action.config(state="normal")
-                )
-                self.after(
-                    0, lambda: self.btn_quiz_submit.config(state="normal")
-                )
+                self.after(0, lambda: self.btn_quiz_action.config(state="normal"))
+                self.after(0, lambda: self.btn_quiz_submit.config(state="normal"))
 
         threading.Thread(target=worker, daemon=True).start()
 
     def _display_error(self, message: str):
-        self.output_txt.config(state="normal")
-        self.output_txt.delete("1.0", tk.END)
-        self.output_txt.insert(tk.END, f"[!] {message}\n", "meta_trail")
-        self.output_txt.config(state="disabled")
+        out = self._get_active_out_txt()
+        out.config(state="normal")
+        out.delete("1.0", tk.END)
+        out.insert(tk.END, f"[!] {message}\n", "meta_trail")
+        out.config(state="disabled")
 
     def _handle_error(self, err_msg: str):
-        self.output_txt.config(state="normal")
-        self.output_txt.delete("1.0", tk.END)
-        self.output_txt.insert(tk.END, f"[!] Error:\n{err_msg}\n", "meta_trail")
-        self.output_txt.config(state="disabled")
+        out = self._get_active_out_txt()
+        out.config(state="normal")
+        out.delete("1.0", tk.END)
+        out.insert(tk.END, f"[!] Error:\n{err_msg}\n", "meta_trail")
+        out.config(state="disabled")
         self._set_status("Failed")
 
 

@@ -1,5 +1,13 @@
-# Local workspace and caches
-workspace_data/
+# Environment & Secrets
 .env
+
+# Local Workspace & Cache
+workspace_data/
+workspace_settings.json
 __pycache__/
 *.pyc
+
+# PyInstaller Build Artifacts
+build/
+dist/
+*.spec
